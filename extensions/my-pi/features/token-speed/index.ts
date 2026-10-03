@@ -97,7 +97,12 @@ export const tokenSpeedFeature: Feature = {
 				}
 				ctx.ui.setStatus(
 					STATUS_KEY,
-					renderSegments(ctx, formatWaitSegments(Date.now() - anchorMs, metrics.inputTokensEstimate)),
+					renderSegments(
+						ctx,
+						// The previous message's average is the best speed
+						// reference available before the first token arrives.
+						formatWaitSegments(Date.now() - anchorMs, metrics.inputTokensEstimate, metrics.stats?.avgTps ?? null),
+					),
 				);
 			}, WAIT_TICK_MS);
 		};

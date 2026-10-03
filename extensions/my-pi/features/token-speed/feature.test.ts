@@ -373,6 +373,33 @@ describe("token-speed feature wiring", () => {
 		expect(h.statuses.get("my-pi")).toBe("I1.2k ⇢0.1s T100 O200 182TPS");
 	});
 
+	it("shows the previous message's average speed while waiting for the first token", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request");
+		h.emit("message_start", { message: assistantMessage() });
+		vi.setSystemTime(START + 100);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(40) },
+		});
+		vi.setSystemTime(START + 1200);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
+		});
+		h.emit("message_end", {
+			message: assistantMessage({ usage: { output: 300, reasoning: 100, cacheRead: 1000, cacheWrite: 200 } }),
+		});
+
+		// Next request: the wait phase references the measured average.
+		h.emit("before_provider_request", {
+			type: "before_provider_request",
+			payload: { model: "model-x", messages: [{ role: "user", content: "x.".repeat(1900) }] },
+		});
+		vi.advanceTimersByTime(100);
+		expect(h.statuses.get("my-pi")).toBe("I1.0k ⇢0.1s ~182 TPS");
+	});
+
 	it("highlights live parts and dims static parts", () => {
 		const settings = new SettingsStore({ file: settingsFile });
 		const harness = makeHarness({ fg: (color, text) => `<${color}>${text}</${color}>` });

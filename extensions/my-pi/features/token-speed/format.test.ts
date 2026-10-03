@@ -30,6 +30,16 @@ describe("formatWaitSegments", () => {
 	it("omits the context when it is unknown", () => {
 		expect(formatWaitSegments(300, null)).toEqual([{ text: "⇢0.3s", live: true }]);
 	});
+
+	it("appends the previous message's average as a frozen speed reference", () => {
+		expect(formatWaitSegments(1234, 115_000, 45.26)).toEqual([
+			{ text: "I115.0k", live: false },
+			{ text: "⇢1.2s", live: true },
+			{ text: "~45.3 TPS", live: false },
+		]);
+		// No measurable previous message: no reference.
+		expect(formatWaitSegments(300, null, null)).toEqual([{ text: "⇢0.3s", live: true }]);
+	});
 });
 
 describe("formatStreamingSegments", () => {

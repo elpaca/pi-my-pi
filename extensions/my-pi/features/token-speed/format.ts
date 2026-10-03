@@ -40,12 +40,23 @@ export function formatStreamingTps(tps: number): string {
 /**
  * Wait-phase segments: the estimated total input size (static for the
  * whole request) plus the live elapsed counter, e.g. `I115.0k ⇢1.3s`.
+ * The previous message's average decode speed is appended as a frozen
+ * reference (`~… TPS`, dim) — the only speed figure available before the
+ * first token arrives; omitted when there is none (first request, or the
+ * last message was too short to measure).
  */
-export function formatWaitSegments(elapsedMs: number, inputTokens: number | null): StatusSegment[] {
+export function formatWaitSegments(
+	elapsedMs: number,
+	inputTokens: number | null,
+	previousTps?: number | null,
+): StatusSegment[] {
 	const segments: StatusSegment[] = [];
 	const cache = inputSegment(inputTokens);
 	if (cache) segments.push(cache);
 	segments.push({ text: `⇢${formatSeconds(elapsedMs)}`, live: true });
+	if (previousTps !== null && previousTps !== undefined) {
+		segments.push({ text: formatStreamingTps(previousTps), live: false });
+	}
 	return segments;
 }
 
