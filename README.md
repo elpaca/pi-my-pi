@@ -9,31 +9,37 @@ Currently: **token speed** in the status bar, managed through a unified `/my-pi`
 
 Shows token counters and LLM throughput in the footer status line:
 
-- **While waiting for the first token**: `C115.0k ⇢1.3s` — the estimated cached-context size
-  (static for the request, dim) plus a live elapsed counter (accent), ticking every 0.1s, so long
+- **While waiting for the first token**: `I115.0k ⇢1.3s` — the estimated total input size
+  (system + tools + messages, estimated once per request from the outgoing payload; static for
+  the request, dim) plus a live elapsed counter (accent), ticking every 0.1s, so long
   server-side thinking is visible instead of a silent bar. Once the first token arrives the same
   counter carries over into the streaming display as the TTFT slot.
-- **While streaming**: `C115.0k T4.5k O8.2k ⇢1.3s ~45.3 TPS` — cached context, streamed thinking
-  tokens, cumulative output tokens, time to first token, and a sliding-window rate. The `O` and
-  `T` counters refresh on **every** delta; the rate figure updates at most once per second. Parts
-  that update in real time render in the accent color, frozen parts stay dim. While the stream is
-  younger than the window the rate is averaged over its actual span (a steady stream shows its
-  true speed from the first sample, no warm-up ramp); once the window is full a burst ages out
-  over exactly 3s. A delivery silence of one full window or more (hidden server-side reasoning,
-  buffering relays) starts a fresh measurement segment, so the rate right after a stall describes
-  the resumed stream, not the stall. Streaming counts are estimated from characters (providers
-  only report authoritative token usage at the end of a message); the `~` marks the rate as an
-  estimate. The `T` slot appears only while thinking content is actually streamed — hidden
-  reasoning stays invisible until the reliable end-of-message count.
-- **When idle**: `C115.0k T4.5k O8.2k ⇢1.2s 45.3TPS` (all dim) for the last assistant message —
-  cached context, thinking tokens, output tokens, TTFT and average decode speed. Reliable provider
-  data wins over estimates: cache comes from `usage.cacheRead + usage.cacheWrite` when reported
-  (otherwise the request-payload estimate), thinking from `usage.reasoning` when reported
-  (otherwise the streamed-thinking char estimate), output from `usage.output` (otherwise the char
-  estimate). The speed numerator is the **visible** output (`usage.output − usage.reasoning`):
-  tokens generated but never streamed (hidden reasoning) don't count. The average is suppressed
-  when the decode window is too short to measure a rate (< 500ms, e.g. whole-message burst
-  delivery) — a rate needs a minimum integration window.
+- **While streaming** the segments follow the temporal order of a request:
+  `I115.0k ⇢1.3s T4.5k O3.7k ~45.3 TPS` — input goes out, the first token arrives (TTFT),
+  thinking streams (`T`), then the visible output (`O`), and the rate describes the whole
+  generation. The `O` and `T` counters refresh on **every** delta; the rate figure updates at
+  most once per second. Parts that update in real time render in the accent color, frozen parts
+  stay dim. While the stream is younger than the window the rate is averaged over its actual
+  span (a steady stream shows its true speed from the first sample, no warm-up ramp); once the
+  window is full a burst ages out over exactly 3s. A delivery silence of one full window or more
+  (hidden server-side reasoning, buffering relays) starts a fresh measurement segment, so the
+  rate right after a stall describes the resumed stream, not the stall. Streaming counts are
+  estimated from characters (providers only report authoritative token usage at the end of a
+  message); the `~` marks the rate as an estimate. `O` counts **non-thinking** output only
+  (text + tool calls) — thinking belongs to `T`, so `T + O` tracks the total output. The `T`
+  slot appears only while thinking content is actually streamed — hidden reasoning stays
+  invisible until the reliable end-of-message count.
+- **When idle**: `I115.0k ⇢1.2s T4.5k O3.7k 45.3TPS` (all dim) for the last assistant message,
+  same order. Reliable provider data wins over estimates: input from
+  `usage.input + usage.cacheRead + usage.cacheWrite` (pi-ai reports the uncached input
+  separately from cache; the sum is the total prompt, matching the payload estimate; otherwise
+  the request-payload estimate is shown), thinking from `usage.reasoning` when reported
+  (otherwise the streamed-thinking char estimate), output from `usage.output − thinking` so
+  `T + O ≈ output` (hidden reasoning belongs to `T`, never to `O`). The speed numerator is the
+  **visible** output (`usage.output − usage.reasoning`): tokens generated but never streamed
+  (hidden reasoning) don't count. The average is suppressed when the decode window is too short
+  to measure a rate (< 500ms, e.g. whole-message burst delivery) — a rate needs a minimum
+  integration window.
 - **Unmeasurable slots show `N/A`** instead of a misleading number: unknown TTFT (no request
   anchor), speed below the measurement limits (burst flush, no visible tokens), or `N/A` alone
   when nothing about a message could be measured. Fields with neither reliable data nor an

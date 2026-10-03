@@ -97,7 +97,7 @@ export const tokenSpeedFeature: Feature = {
 				}
 				ctx.ui.setStatus(
 					STATUS_KEY,
-					renderSegments(ctx, formatWaitSegments(Date.now() - anchorMs, metrics.cacheTokensEstimate)),
+					renderSegments(ctx, formatWaitSegments(Date.now() - anchorMs, metrics.inputTokensEstimate)),
 				);
 			}, WAIT_TICK_MS);
 		};
@@ -143,12 +143,13 @@ export const tokenSpeedFeature: Feature = {
 			lastCtx = ctx;
 			const now = Date.now();
 			metrics.onRequestStart(now);
-			// Estimate the cached-context size from the outgoing payload once per
-			// request, with the same calibration the live display will use.
+			// Estimate the total input size (system + tools + messages) from the
+			// outgoing payload once per request, with the same calibration the
+			// live display will use.
 			const model = ctx.model;
 			const calibration = model ? cache.get(calibrationKey(model.provider, model.id)) : undefined;
 			const chars = countPayloadChars(event.payload);
-			metrics.setRequestContext(
+			metrics.setInputEstimate(
 				countTotalChars(chars) > 0 ? Math.round(estimateTokens(chars, calibration ?? DEFAULT_CALIBRATION)) : null,
 			);
 			startWaitTimer(ctx, now);

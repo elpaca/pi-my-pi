@@ -99,7 +99,7 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(400) },
 		});
 		const live = h.statuses.get("my-pi");
-		expect(live).toMatch(/^O\d+ ⇢\d+(\.\d+)?s ~\d+(\.\d+)? TPS$/);
+		expect(live).toMatch(/^⇢\d+(\.\d+)?s O\d+ ~\d+(\.\d+)? TPS$/);
 
 		// Token counters refresh on every delta even inside the 1s throttle;
 		// only the rate figure itself stays frozen.
@@ -128,7 +128,7 @@ describe("token-speed feature wiring", () => {
 			message: assistantMessage({ usage: { output: 300 } }),
 		});
 		const idle = h.statuses.get("my-pi");
-		expect(idle).toMatch(/^O\d+ ⇢\d+(\.\d+)s \d+(\.\d+)?TPS$/);
+		expect(idle).toMatch(/^⇢\d+(\.\d+)s O\d+ \d+(\.\d+)?TPS$/);
 
 		// Turn ends: stats persisted exactly once.
 		h.emit("turn_end");
@@ -178,7 +178,7 @@ describe("token-speed feature wiring", () => {
 			[{ type: "custom", customType: "my-pi.token-speed", data: stats }] as never[];
 
 		h.emit("session_start", { type: "session_start", reason: "resume" });
-		expect(h.statuses.get("my-pi")).toBe("O67 ⇢0.8s 33.3TPS");
+		expect(h.statuses.get("my-pi")).toBe("⇢0.8s O67 33.3TPS");
 
 		// No duplicate persistence for restored stats.
 		h.emit("turn_end");
@@ -218,7 +218,7 @@ describe("token-speed feature wiring", () => {
 		expect(h.statuses.get("my-pi")).toBeUndefined();
 
 		h.emit("message_end", { message: assistantMessage({ usage: { output: 50 } }) });
-		expect(h.statuses.get("my-pi")).toMatch(/^O\d+ ⇢/);
+		expect(h.statuses.get("my-pi")).toMatch(/^⇢\d*\.\ds O\d+/);
 	});
 
 	it("shows a live elapsed counter while waiting for the first token", () => {
@@ -243,7 +243,7 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(400) },
 		});
 		const live = h.statuses.get("my-pi");
-		expect(live).toMatch(/^O\d+ ⇢\d+(\.\d+)?s ~\d+(\.\d+)? TPS$/);
+		expect(live).toMatch(/^⇢\d+(\.\d+)?s O\d+ ~\d+(\.\d+)? TPS$/);
 		vi.advanceTimersByTime(2000);
 		expect(h.statuses.get("my-pi")).toBe(live);
 	});
@@ -307,7 +307,7 @@ describe("token-speed feature wiring", () => {
 			payload: { model: "model-x", messages: [{ role: "user", content: "x.".repeat(1900) }] },
 		});
 		vi.advanceTimersByTime(100);
-		expect(h.statuses.get("my-pi")).toBe("C1.0k ⇢0.1s");
+		expect(h.statuses.get("my-pi")).toBe("I1.0k ⇢0.1s");
 
 		h.emit("message_start", { message: assistantMessage() });
 		vi.setSystemTime(START + 300);
@@ -316,14 +316,14 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
 		});
 		// First delta: counters live, rate still inside its minimum window.
-		expect(h.statuses.get("my-pi")).toBe("C1.0k O100 ⇢0.3s");
+		expect(h.statuses.get("my-pi")).toBe("I1.0k ⇢0.3s O100");
 
 		vi.setSystemTime(START + 600);
 		h.emit("message_update", {
 			message: assistantMessage(),
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
 		});
-		expect(h.statuses.get("my-pi")).toBe("C1.0k O200 ⇢0.3s ~667 TPS");
+		expect(h.statuses.get("my-pi")).toBe("I1.0k ⇢0.3s O200 ~667 TPS");
 	});
 
 	it("updates thinking and output counts on every delta while the rate stays throttled", () => {
@@ -335,14 +335,14 @@ describe("token-speed feature wiring", () => {
 			message: assistantMessage(),
 			assistantMessageEvent: { type: "thinking_delta", delta: "x".repeat(38) },
 		});
-		expect(h.statuses.get("my-pi")).toBe("T10 O10 ⇢0.1s");
+		expect(h.statuses.get("my-pi")).toBe("⇢0.1s T10 O0");
 
 		vi.setSystemTime(START + 300);
 		h.emit("message_update", {
 			message: assistantMessage(),
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
 		});
-		expect(h.statuses.get("my-pi")).toBe("T10 O110 ⇢0.1s");
+		expect(h.statuses.get("my-pi")).toBe("⇢0.1s T10 O100");
 
 		vi.setSystemTime(START + 500);
 		h.emit("message_update", {
@@ -350,7 +350,7 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "thinking_delta", delta: "x".repeat(38) },
 		});
 		// T/O grew on every delta; the rate appeared as soon as it was measurable.
-		expect(h.statuses.get("my-pi")).toBe("T20 O120 ⇢0.1s ~300 TPS");
+		expect(h.statuses.get("my-pi")).toBe("⇢0.1s T20 O100 ~300 TPS");
 	});
 
 	it("shows reliable cache, thinking and output counts when the message ends", () => {
@@ -370,7 +370,7 @@ describe("token-speed feature wiring", () => {
 		h.emit("message_end", {
 			message: assistantMessage({ usage: { output: 300, reasoning: 100, cacheRead: 1000, cacheWrite: 200 } }),
 		});
-		expect(h.statuses.get("my-pi")).toBe("C1.2k T100 O300 ⇢0.1s 182TPS");
+		expect(h.statuses.get("my-pi")).toBe("I1.2k ⇢0.1s T100 O200 182TPS");
 	});
 
 	it("highlights live parts and dims static parts", () => {
@@ -384,7 +384,7 @@ describe("token-speed feature wiring", () => {
 			payload: { messages: [{ content: "x.".repeat(1900) }] },
 		});
 		vi.advanceTimersByTime(100);
-		expect(statuses.get("my-pi")).toBe("<dim>C1.0k</dim> <accent>⇢0.1s</accent>");
+		expect(statuses.get("my-pi")).toBe("<dim>I1.0k</dim> <accent>⇢0.1s</accent>");
 
 		emit("message_start", { message: assistantMessage() });
 		vi.setSystemTime(START + 100);
@@ -398,7 +398,7 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
 		});
 		expect(statuses.get("my-pi")).toBe(
-			"<dim>C1.0k</dim> <accent>O200</accent> <dim>⇢0.1s</dim> <accent>~667 TPS</accent>",
+			"<dim>I1.0k</dim> <dim>⇢0.1s</dim> <accent>O200</accent> <accent>~667 TPS</accent>",
 		);
 	});
 

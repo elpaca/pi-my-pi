@@ -22,7 +22,7 @@ describe("formatTokenCount", () => {
 describe("formatWaitSegments", () => {
 	it("shows the context estimate static and the counter live", () => {
 		expect(formatWaitSegments(1234, 115_000)).toEqual([
-			{ text: "C115.0k", live: false },
+			{ text: "I115.0k", live: false },
 			{ text: "⇢1.2s", live: true },
 		]);
 	});
@@ -35,20 +35,21 @@ describe("formatWaitSegments", () => {
 describe("formatStreamingSegments", () => {
 	const sample = (overrides: Partial<LiveSample>): LiveSample => ({
 		estimatedTokens: 8200,
+		estimatedOutputTokens: 3700,
 		estimatedThinkingTokens: 4500,
-		cacheTokens: 115_000,
+		inputTokens: 115_000,
 		ttftMs: 1300,
 		elapsedMs: 5000,
 		tps: 45.26,
 		...overrides,
 	});
 
-	it("renders C T O ⇢ ~TPS with live flags on the updating parts", () => {
+	it("renders I ⇢ T O ~TPS in temporal order with live flags on the updating parts", () => {
 		expect(formatStreamingSegments(sample({}))).toEqual([
-			{ text: "C115.0k", live: false },
-			{ text: "T4.5k", live: true },
-			{ text: "O8.2k", live: true },
+			{ text: "I115.0k", live: false },
 			{ text: "⇢1.3s", live: false },
+			{ text: "T4.5k", live: true },
+			{ text: "O3.7k", live: true },
 			{ text: "~45.3 TPS", live: true },
 		]);
 	});
@@ -62,9 +63,9 @@ describe("formatStreamingSegments", () => {
 	});
 
 	it("omits unstreamed thinking, unknown context and a too-young rate", () => {
-		expect(formatStreamingSegments(sample({ estimatedThinkingTokens: null, cacheTokens: null, tps: null }))).toEqual([
-			{ text: "O8.2k", live: true },
+		expect(formatStreamingSegments(sample({ estimatedThinkingTokens: null, inputTokens: null, tps: null }))).toEqual([
 			{ text: "⇢1.3s", live: false },
+			{ text: "O3.7k", live: true },
 		]);
 	});
 });
@@ -93,19 +94,19 @@ describe("formatIdleSegments", () => {
 		outputTokens: 8200,
 		reasoningTokens: 4500,
 		estimated: false,
-		cacheTokens: 115_000,
-		cacheEstimated: false,
+		inputTokens: 115_000,
+		inputEstimated: false,
 		chars: { cjk: 0, nonCjk: 0 },
 		endedAt: 0,
 		...overrides,
 	});
 
-	it("renders C T O ⇢ TPS, all static", () => {
+	it("renders I ⇢ T O TPS in temporal order, all static", () => {
 		expect(formatIdleSegments(stats())).toEqual([
-			{ text: "C115.0k", live: false },
-			{ text: "T4.5k", live: false },
-			{ text: "O8.2k", live: false },
+			{ text: "I115.0k", live: false },
 			{ text: "⇢1.2s", live: false },
+			{ text: "T4.5k", live: false },
+			{ text: "O3.7k", live: false },
 			{ text: "45.3TPS", live: false },
 		]);
 	});
@@ -123,8 +124,8 @@ describe("formatIdleSegments", () => {
 	});
 
 	it("shows estimated cache the same way as reported cache", () => {
-		expect(formatIdleSegments(stats({ cacheEstimated: true, cacheTokens: 900 }))).toContainEqual({
-			text: "C900",
+		expect(formatIdleSegments(stats({ inputEstimated: true, inputTokens: 900 }))).toContainEqual({
+			text: "I900",
 			live: false,
 		});
 	});
@@ -134,23 +135,29 @@ describe("formatIdleSegments", () => {
 		expect(formatIdleSegments(stats({ avgTps: null }))).toContainEqual({ text: "N/A", live: false });
 		// No anchor: ttft slot N/A.
 		expect(formatIdleSegments(stats({ ttftMs: null }))).toContainEqual({ text: "⇢N/A", live: false });
-		// Nothing streamable and no thinking: C/T slots gone.
+		// Nothing streamable and no thinking: I/T slots gone.
 		expect(
-			formatIdleSegments(stats({ reasoningTokens: 0, cacheTokens: undefined, cacheEstimated: undefined })),
+			formatIdleSegments(stats({ reasoningTokens: 0, inputTokens: undefined, inputEstimated: undefined })),
 		).toEqual([
-			{ text: "O8.2k", live: false },
 			{ text: "⇢1.2s", live: false },
+			{ text: "O8.2k", live: false },
 			{ text: "45.3TPS", live: false },
 		]);
 	});
 
 	it("appends a single N/A tail when ttft and tps are both gone", () => {
 		expect(formatIdleSegments(stats({ ttftMs: null, avgTps: null }))).toEqual([
-			{ text: "C115.0k", live: false },
+			{ text: "I115.0k", live: false },
 			{ text: "T4.5k", live: false },
-			{ text: "O8.2k", live: false },
+			{ text: "O3.7k", live: false },
 			{ text: "N/A", live: false },
 		]);
+	});
+
+	it("omits O when every output token is thinking", () => {
+		const segments = formatIdleSegments(stats({ outputTokens: 500, reasoningTokens: 500 }));
+		expect(segments).toContainEqual({ text: "T500", live: false });
+		expect(segments.find((segment) => segment.text.startsWith("O"))).toBeUndefined();
 	});
 
 	it("returns no segments when nothing about the message is measurable", () => {
@@ -161,8 +168,8 @@ describe("formatIdleSegments", () => {
 					avgTps: null,
 					outputTokens: 0,
 					reasoningTokens: 0,
-					cacheTokens: undefined,
-					cacheEstimated: undefined,
+					inputTokens: undefined,
+					inputEstimated: undefined,
 				}),
 			),
 		).toEqual([]);

@@ -27,9 +27,9 @@ export function formatTokenCount(tokens: number): string {
 	return String(Math.round(tokens));
 }
 
-function cacheSegment(tokens: number | null | undefined): StatusSegment | null {
+function inputSegment(tokens: number | null | undefined): StatusSegment | null {
 	if (tokens === null || tokens === undefined || tokens <= 0) return null;
-	return { text: `C${formatTokenCount(tokens)}`, live: false };
+	return { text: `I${formatTokenCount(tokens)}`, live: false };
 }
 
 /** The speed part of the streaming status, e.g. "~45.3 TPS". The "~" marks it as an estimate. */
@@ -38,33 +38,36 @@ export function formatStreamingTps(tps: number): string {
 }
 
 /**
- * Wait-phase segments: the estimated cached-context size (static for the
- * whole request) plus the live elapsed counter, e.g. `C115.0k ⇢1.3s`.
+ * Wait-phase segments: the estimated total input size (static for the
+ * whole request) plus the live elapsed counter, e.g. `I115.0k ⇢1.3s`.
  */
-export function formatWaitSegments(elapsedMs: number, cacheTokens: number | null): StatusSegment[] {
+export function formatWaitSegments(elapsedMs: number, inputTokens: number | null): StatusSegment[] {
 	const segments: StatusSegment[] = [];
-	const cache = cacheSegment(cacheTokens);
+	const cache = inputSegment(inputTokens);
 	if (cache) segments.push(cache);
 	segments.push({ text: `⇢${formatSeconds(elapsedMs)}`, live: true });
 	return segments;
 }
 
 /**
- * Streaming segments: `C… T… O… ⇢… ~… TPS`. O updates on every delta while
- * streaming; T appears only while thinking content is actually streamed
- * (hidden reasoning stays invisible until the reliable end-of-message count);
- * the ttft prefix is frozen after the first token; the window rate is
- * throttled upstream. Unmeasurable slots show N/A or are omitted.
+ * Streaming segments in temporal order: `I… ⇢… T… O… ~… TPS` — input goes
+ * out, the first token arrives (ttft), thinking streams, then the visible
+ * output, and the rate describes the whole generation. O (non-thinking
+ * output) and T update on every delta while streaming; T appears only while
+ * thinking content is actually streamed (hidden reasoning stays invisible
+ * until the reliable end-of-message count); the ttft slot is frozen after
+ * the first token; the window rate is throttled upstream. Unmeasurable
+ * slots show N/A or are omitted.
  */
 export function formatStreamingSegments(sample: LiveSample): StatusSegment[] {
 	const segments: StatusSegment[] = [];
-	const cache = cacheSegment(sample.cacheTokens);
-	if (cache) segments.push(cache);
+	const input = inputSegment(sample.inputTokens);
+	if (input) segments.push(input);
+	segments.push({ text: sample.ttftMs !== null ? `⇢${formatSeconds(sample.ttftMs)}` : "⇢N/A", live: false });
 	if (sample.estimatedThinkingTokens !== null) {
 		segments.push({ text: `T${formatTokenCount(sample.estimatedThinkingTokens)}`, live: true });
 	}
-	segments.push({ text: `O${formatTokenCount(sample.estimatedTokens)}`, live: true });
-	segments.push({ text: sample.ttftMs !== null ? `⇢${formatSeconds(sample.ttftMs)}` : "⇢N/A", live: false });
+	segments.push({ text: `O${formatTokenCount(sample.estimatedOutputTokens)}`, live: true });
 	if (sample.tps !== null) {
 		segments.push({ text: formatStreamingTps(sample.tps), live: true });
 	}
@@ -72,32 +75,39 @@ export function formatStreamingSegments(sample: LiveSample): StatusSegment[] {
 }
 
 /**
- * Idle segments for the last completed message, e.g. `C115.0k T4.5k O8.2k
- * ⇢1.2s 45.3TPS`; everything is final, so nothing highlights. Reliable data
- * wins over estimates (provider reasoning over streamed-thinking estimate);
- * fields with neither are omitted, and a missing ttft/tps slot shows N/A.
+ * Idle segments for the last completed message, e.g. `I115.0k ⇢1.2s T4.5k
+ * O8.2k 45.3TPS`, in the same temporal order as the streaming display;
+ * everything is final, so nothing highlights. Reliable data wins over
+ * estimates (provider reasoning over streamed-thinking estimate); O shows
+ * the non-thinking output (T + O ≈ output); fields with neither reliable
+ * data nor an estimate are omitted, and a missing ttft/tps slot shows N/A.
  * Returns [] when nothing about the message could be measured at all.
  */
 export function formatIdleSegments(stats: LastMessageStats): StatusSegment[] {
 	const segments: StatusSegment[] = [];
-	const cache = cacheSegment(stats.cacheTokens);
-	if (cache) segments.push(cache);
+	const input = inputSegment(stats.inputTokens);
+	if (input) segments.push(input);
+	const ttft = stats.ttftMs !== null ? `⇢${formatSeconds(stats.ttftMs)}` : null;
+	const tps = stats.avgTps !== null ? `${formatTps(stats.avgTps)}TPS` : null;
+	if (ttft !== null || tps !== null) {
+		segments.push({ text: ttft ?? "⇢N/A", live: false });
+	}
 	const thinking = stats.reasoningTokens > 0 ? stats.reasoningTokens : (stats.thinkingEstimatedTokens ?? 0);
 	if (thinking > 0) {
 		segments.push({ text: `T${formatTokenCount(thinking)}`, live: false });
 	}
-	if (stats.outputTokens > 0) {
-		segments.push({ text: `O${formatTokenCount(stats.outputTokens)}`, live: false });
+	// O is the non-thinking output only (T + O ≈ output); hidden reasoning
+	// belongs to T, never to O.
+	const output = stats.outputTokens - thinking;
+	if (output > 0) {
+		segments.push({ text: `O${formatTokenCount(output)}`, live: false });
 	}
-	const ttft = stats.ttftMs !== null ? `⇢${formatSeconds(stats.ttftMs)}` : null;
-	const tps = stats.avgTps !== null ? `${formatTps(stats.avgTps)}TPS` : null;
-	if (ttft === null && tps === null) {
-		if (segments.length > 0) {
-			segments.push({ text: "N/A", live: false });
-		}
-		return segments;
+	if (ttft !== null || tps !== null) {
+		segments.push({ text: tps ?? "N/A", live: false });
+	} else if (segments.length > 0) {
+		// No speed slot at all: a single N/A tail says the message ended
+		// without anything measurable beyond the counters above.
+		segments.push({ text: "N/A", live: false });
 	}
-	segments.push({ text: ttft ?? "⇢N/A", live: false });
-	segments.push({ text: tps ?? "N/A", live: false });
 	return segments;
 }

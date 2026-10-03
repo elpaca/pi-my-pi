@@ -222,23 +222,24 @@ describe("StreamMetrics", () => {
 	it("reset clears everything including restored stats", () => {
 		const metrics = new StreamMetrics();
 		feedCompleteMessage(metrics);
-		metrics.setRequestContext(1234);
+		metrics.setInputEstimate(1234);
 		metrics.reset();
 		expect(metrics.stats).toBeUndefined();
 		expect(metrics.liveSample(T0 + 9999)).toBeUndefined();
-		expect(metrics.cacheTokensEstimate).toBeNull();
+		expect(metrics.inputTokensEstimate).toBeNull();
 	});
 
 	it("liveSample reports streamed thinking and the request context estimate", () => {
 		const metrics = new StreamMetrics();
-		metrics.setRequestContext(115_000);
+		metrics.setInputEstimate(115_000);
 		metrics.onMessageStart(T0);
 		metrics.onDelta("思考", "thinking", T0 + 100); // 2 CJK chars → 2 tokens
 		metrics.onDelta("hello ", "text", T0 + 600); // 6 chars → 1.5 tokens
 		const sample = metrics.liveSample(T0 + 1100, CALIBRATION);
 		expect(sample?.estimatedThinkingTokens).toBe(2);
-		expect(sample?.cacheTokens).toBe(115_000);
+		expect(sample?.inputTokens).toBe(115_000);
 		expect(sample?.estimatedTokens).toBeCloseTo(3.5, 5); // thinking + text
+		expect(sample?.estimatedOutputTokens).toBeCloseTo(1.5, 5); // text only: O excludes thinking
 	});
 
 	it("liveSample omits thinking and context when neither is known", () => {
@@ -247,38 +248,41 @@ describe("StreamMetrics", () => {
 		metrics.onDelta("hello ", "text", T0 + 100);
 		const sample = metrics.liveSample(T0 + 600, CALIBRATION);
 		expect(sample?.estimatedThinkingTokens).toBeNull();
-		expect(sample?.cacheTokens).toBeNull();
+		expect(sample?.inputTokens).toBeNull();
 	});
 
-	it("onMessageEnd prefers reported cacheRead/cacheWrite over the request estimate", () => {
+	it("onMessageEnd prefers the reported total input over the request estimate", () => {
 		const metrics = new StreamMetrics();
-		metrics.setRequestContext(115_000);
+		metrics.setInputEstimate(115_000);
 		metrics.onMessageStart(T0);
 		metrics.onDelta("hello ", "text", T0 + 100);
 		const stats = metrics.onMessageEnd(
-			{ output: 10, cacheRead: 1000, cacheWrite: 200 },
+			{ output: 10, input: 500, cacheRead: 1000, cacheWrite: 200 },
 			"prov",
 			"model",
 			T0 + 200,
 			CALIBRATION,
 		);
-		expect(stats?.cacheTokens).toBe(1200);
-		expect(stats?.cacheEstimated).toBe(false);
+		// pi-ai reports uncached input separately from cache read/write; the
+		// total prompt is their sum.
+		expect(stats?.inputTokens).toBe(1700);
+		expect(stats?.inputEstimated).toBe(false);
 	});
 
-	it("onMessageEnd falls back to the request estimate without reported cache", () => {
+	it("onMessageEnd falls back to the request estimate without reported input", () => {
 		const metrics = new StreamMetrics();
-		metrics.setRequestContext(900);
+		metrics.setInputEstimate(900);
 		metrics.onMessageStart(T0);
 		metrics.onDelta("思考", "thinking", T0 + 100);
 		const estimated = metrics.onMessageEnd({ output: 10 }, "prov", "model", T0 + 200, CALIBRATION);
-		expect(estimated?.cacheTokens).toBe(900);
-		expect(estimated?.cacheEstimated).toBe(true);
+		expect(estimated?.inputTokens).toBe(900);
+		expect(estimated?.inputEstimated).toBe(true);
 		// Streamed thinking was recorded as an estimate; reasoning was not reported.
 		expect(estimated?.reasoningTokens).toBe(0);
 		expect(estimated?.thinkingEstimatedTokens).toBe(2);
 
-		// Reported reasoning is the reliable count; reported zero cache still
+		// Reported reasoning is the reliable count; reported zero input still
+		// falls back to the request estimate.
 		// falls back to the request estimate.
 		const reliable = metrics.onMessageEnd(
 			{ output: 10, reasoning: 7, cacheRead: 0, cacheWrite: 0 },
@@ -288,16 +292,16 @@ describe("StreamMetrics", () => {
 			CALIBRATION,
 		);
 		expect(reliable?.reasoningTokens).toBe(7);
-		expect(reliable?.cacheTokens).toBe(900);
-		expect(reliable?.cacheEstimated).toBe(true);
+		expect(reliable?.inputTokens).toBe(900);
+		expect(reliable?.inputEstimated).toBe(true);
 
-		// Without any request context and without reported cache there is no data.
+		// Without any request context and without reported input there is no data.
 		const bare = new StreamMetrics();
 		bare.onMessageStart(T0);
 		bare.onDelta("x", "text", T0 + 100);
 		const noCache = bare.onMessageEnd({ output: 3, cacheRead: 0, cacheWrite: 0 }, "prov", "model", T0 + 200);
-		expect(noCache?.cacheTokens).toBeUndefined();
-		expect(noCache?.cacheEstimated).toBeUndefined();
+		expect(noCache?.inputTokens).toBeUndefined();
+		expect(noCache?.inputEstimated).toBeUndefined();
 	});
 });
 
@@ -344,7 +348,7 @@ describe("parseLastStats", () => {
 		expect(parsed?.reasoningTokens).toBe(2);
 	});
 
-	it("parses optional thinking and cache fields and ignores garbage", () => {
+	it("parses optional thinking and input fields and ignores garbage", () => {
 		const base = {
 			provider: "p",
 			model: "m",
@@ -357,17 +361,21 @@ describe("parseLastStats", () => {
 			chars: { cjk: 0, nonCjk: 40 },
 			endedAt: 1,
 		};
-		const parsed = parseLastStats({ ...base, thinkingEstimatedTokens: 30, cacheTokens: 1200, cacheEstimated: true });
+		const parsed = parseLastStats({ ...base, thinkingEstimatedTokens: 30, inputTokens: 1200, inputEstimated: true });
 		expect(parsed?.thinkingEstimatedTokens).toBe(30);
-		expect(parsed?.cacheTokens).toBe(1200);
-		expect(parsed?.cacheEstimated).toBe(true);
+		expect(parsed?.inputTokens).toBe(1200);
+		expect(parsed?.inputEstimated).toBe(true);
 		const legacy = parseLastStats(base);
 		expect(legacy?.thinkingEstimatedTokens).toBeUndefined();
-		expect(legacy?.cacheTokens).toBeUndefined();
-		expect(legacy?.cacheEstimated).toBeUndefined();
-		const garbage = parseLastStats({ ...base, cacheTokens: "many", thinkingEstimatedTokens: -5 });
-		expect(garbage?.cacheTokens).toBeUndefined();
+		expect(legacy?.inputTokens).toBeUndefined();
+		expect(legacy?.inputEstimated).toBeUndefined();
+		const garbage = parseLastStats({ ...base, inputTokens: "many", thinkingEstimatedTokens: -5 });
+		expect(garbage?.inputTokens).toBeUndefined();
 		expect(garbage?.thinkingEstimatedTokens).toBeUndefined();
+		// Entries from the brief "cacheTokens" naming still parse as input.
+		const oldNaming = parseLastStats({ ...base, cacheTokens: 800, cacheEstimated: true });
+		expect(oldNaming?.inputTokens).toBe(800);
+		expect(oldNaming?.inputEstimated).toBe(true);
 	});
 
 	it("rejects malformed payloads", () => {
