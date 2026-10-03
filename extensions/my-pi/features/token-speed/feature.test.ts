@@ -10,7 +10,9 @@ type Handler = (event: unknown, ctx: ExtensionContext) => void;
 
 const START = 1_000_000;
 
-function makeHarness() {
+type TestTheme = { fg: (color: string, text: string) => string };
+
+function makeHarness(theme?: TestTheme) {
 	const handlers = new Map<string, Handler[]>();
 	const entries: Array<{ customType: string; data: unknown }> = [];
 	const statuses = new Map<string, string | undefined>();
@@ -33,7 +35,7 @@ function makeHarness() {
 			setStatus: (key: string, text: string | undefined) => {
 				statuses.set(key, text);
 			},
-			theme: { fg: (_color: string, text: string) => text },
+			theme: theme ?? { fg: (_color: string, text: string) => text },
 			notify: () => {},
 		},
 		sessionManager: { getBranch: () => [] as unknown[] },
@@ -97,15 +99,20 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(400) },
 		});
 		const live = h.statuses.get("my-pi");
-		expect(live).toMatch(/^⇢\d+(\.\d+)?s ~\d+(\.\d+)? TPS$/);
+		expect(live).toMatch(/^O\d+ ⇢\d+(\.\d+)?s ~\d+(\.\d+)? TPS$/);
 
-		// A second render within 1s must not overwrite (throttled).
+		// Token counters refresh on every delta even inside the 1s throttle;
+		// only the rate figure itself stays frozen.
 		vi.setSystemTime(START + 900);
 		h.emit("message_update", {
 			message: assistantMessage(),
 			assistantMessageEvent: { type: "text_delta", delta: "y".repeat(400) },
 		});
-		expect(h.statuses.get("my-pi")).toBe(live);
+		const updated = h.statuses.get("my-pi");
+		expect(updated).not.toBe(live); // O grew
+		const rate = (live?.match(/~\d+(\.\d+)? TPS$/) ?? [""])[0];
+		expect(rate).not.toBe("");
+		expect(updated).toContain(rate); // throttled rate unchanged
 
 		// After 1s the value updates again.
 		vi.setSystemTime(START + 1600);
@@ -121,7 +128,7 @@ describe("token-speed feature wiring", () => {
 			message: assistantMessage({ usage: { output: 300 } }),
 		});
 		const idle = h.statuses.get("my-pi");
-		expect(idle).toMatch(/^⇢\d+(\.\d+)s \d+(\.\d+)?TPS$/);
+		expect(idle).toMatch(/^O\d+ ⇢\d+(\.\d+)s \d+(\.\d+)?TPS$/);
 
 		// Turn ends: stats persisted exactly once.
 		h.emit("turn_end");
@@ -171,7 +178,7 @@ describe("token-speed feature wiring", () => {
 			[{ type: "custom", customType: "my-pi.token-speed", data: stats }] as never[];
 
 		h.emit("session_start", { type: "session_start", reason: "resume" });
-		expect(h.statuses.get("my-pi")).toBe("⇢0.8s 33.3TPS");
+		expect(h.statuses.get("my-pi")).toBe("O67 ⇢0.8s 33.3TPS");
 
 		// No duplicate persistence for restored stats.
 		h.emit("turn_end");
@@ -211,7 +218,7 @@ describe("token-speed feature wiring", () => {
 		expect(h.statuses.get("my-pi")).toBeUndefined();
 
 		h.emit("message_end", { message: assistantMessage({ usage: { output: 50 } }) });
-		expect(h.statuses.get("my-pi")).toMatch(/^⇢/);
+		expect(h.statuses.get("my-pi")).toMatch(/^O\d+ ⇢/);
 	});
 
 	it("shows a live elapsed counter while waiting for the first token", () => {
@@ -236,7 +243,7 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(400) },
 		});
 		const live = h.statuses.get("my-pi");
-		expect(live).toMatch(/^⇢\d+(\.\d+)?s ~\d+(\.\d+)? TPS$/);
+		expect(live).toMatch(/^O\d+ ⇢\d+(\.\d+)?s ~\d+(\.\d+)? TPS$/);
 		vi.advanceTimersByTime(2000);
 		expect(h.statuses.get("my-pi")).toBe(live);
 	});
@@ -250,9 +257,9 @@ describe("token-speed feature wiring", () => {
 		h.emit("message_start", { message: assistantMessage() });
 		h.emit("message_end", { message: assistantMessage({ usage: { output: 10 } }) });
 		// Nothing was streamable (no deltas → no ttft, no measurable speed).
-		expect(h.statuses.get("my-pi")).toBe("N/A");
+		expect(h.statuses.get("my-pi")).toBe("O10 N/A");
 		vi.advanceTimersByTime(500); // timer gone: no updates, no crash
-		expect(h.statuses.get("my-pi")).toBe("N/A");
+		expect(h.statuses.get("my-pi")).toBe("O10 N/A");
 	});
 
 	it("does not show the wait counter when showDuringStream is off", () => {
@@ -291,6 +298,108 @@ describe("token-speed feature wiring", () => {
 		expect(h.statuses.get("my-pi")).toBeDefined();
 		h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
 		expect(h.statuses.get("my-pi")).toBeUndefined();
+	});
+
+	it("shows the estimated cache size during the wait and streaming phases", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request", {
+			type: "before_provider_request",
+			payload: { model: "model-x", messages: [{ role: "user", content: "x.".repeat(1900) }] },
+		});
+		vi.advanceTimersByTime(100);
+		expect(h.statuses.get("my-pi")).toBe("C1.0k ⇢0.1s");
+
+		h.emit("message_start", { message: assistantMessage() });
+		vi.setSystemTime(START + 300);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
+		});
+		// First delta: counters live, rate still inside its minimum window.
+		expect(h.statuses.get("my-pi")).toBe("C1.0k O100 ⇢0.3s");
+
+		vi.setSystemTime(START + 600);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
+		});
+		expect(h.statuses.get("my-pi")).toBe("C1.0k O200 ⇢0.3s ~667 TPS");
+	});
+
+	it("updates thinking and output counts on every delta while the rate stays throttled", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request");
+		h.emit("message_start", { message: assistantMessage() });
+		vi.setSystemTime(START + 100);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "thinking_delta", delta: "x".repeat(38) },
+		});
+		expect(h.statuses.get("my-pi")).toBe("T10 O10 ⇢0.1s");
+
+		vi.setSystemTime(START + 300);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
+		});
+		expect(h.statuses.get("my-pi")).toBe("T10 O110 ⇢0.1s");
+
+		vi.setSystemTime(START + 500);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "thinking_delta", delta: "x".repeat(38) },
+		});
+		// T/O grew on every delta; the rate appeared as soon as it was measurable.
+		expect(h.statuses.get("my-pi")).toBe("T20 O120 ⇢0.1s ~300 TPS");
+	});
+
+	it("shows reliable cache, thinking and output counts when the message ends", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request");
+		h.emit("message_start", { message: assistantMessage() });
+		vi.setSystemTime(START + 100);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(40) },
+		});
+		vi.setSystemTime(START + 1200);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
+		});
+		h.emit("message_end", {
+			message: assistantMessage({ usage: { output: 300, reasoning: 100, cacheRead: 1000, cacheWrite: 200 } }),
+		});
+		expect(h.statuses.get("my-pi")).toBe("C1.2k T100 O300 ⇢0.1s 182TPS");
+	});
+
+	it("highlights live parts and dims static parts", () => {
+		const settings = new SettingsStore({ file: settingsFile });
+		const harness = makeHarness({ fg: (color, text) => `<${color}>${text}</${color}>` });
+		tokenSpeedFeature.register({ pi: harness.pi, settings });
+		const { emit, statuses } = harness;
+
+		emit("before_provider_request", {
+			type: "before_provider_request",
+			payload: { messages: [{ content: "x.".repeat(1900) }] },
+		});
+		vi.advanceTimersByTime(100);
+		expect(statuses.get("my-pi")).toBe("<dim>C1.0k</dim> <accent>⇢0.1s</accent>");
+
+		emit("message_start", { message: assistantMessage() });
+		vi.setSystemTime(START + 100);
+		emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
+		});
+		vi.setSystemTime(START + 400);
+		emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
+		});
+		expect(statuses.get("my-pi")).toBe(
+			"<dim>C1.0k</dim> <accent>O200</accent> <dim>⇢0.1s</dim> <accent>~667 TPS</accent>",
+		);
 	});
 
 	it("ignores non-assistant messages", () => {

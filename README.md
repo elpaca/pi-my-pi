@@ -7,27 +7,38 @@ Currently: **token speed** in the status bar, managed through a unified `/my-pi`
 
 ### token-speed
 
-Shows LLM token throughput in the footer status line:
+Shows token counters and LLM throughput in the footer status line:
 
-- **While waiting for the first token**: `⇢1.3s` (accent color) — a live elapsed counter, ticking
-  every 0.1s, so long server-side thinking is visible instead of a silent bar. Once the first token
-  arrives the same prefix carries over into the streaming display.
-- **While streaming**: `⇢1.3s ~45.3 TPS` (accent color) — time to first token plus a sliding-window
-  rate over the last 3s, refreshed at most once per second. While the stream is younger than the
-  window the rate is averaged over its actual span (a steady stream shows its true speed from the
-  first sample, no warm-up ramp); once the window is full a burst ages out over exactly 3s. A
-  delivery silence of one full window or more (hidden server-side reasoning, buffering relays)
-  starts a fresh measurement segment, so the rate right after a stall describes the resumed stream,
-  not the stall. Streaming token counts are estimated from characters (providers only report
-  authoritative token usage at the end of a message); `~` marks the value as an estimate.
-- **When idle**: `⇢1.2s 45.3TPS` (dim color) for the last assistant message — time to first token
-  and average decode speed. The speed numerator is the **visible** output (`usage.output −
-  usage.reasoning`): tokens generated but never streamed (hidden reasoning) don't count. The
-  average is suppressed when the decode window is too short to measure a rate (< 500ms, e.g.
-  whole-message burst delivery) — a rate needs a minimum integration window.
+- **While waiting for the first token**: `C115.0k ⇢1.3s` — the estimated cached-context size
+  (static for the request, dim) plus a live elapsed counter (accent), ticking every 0.1s, so long
+  server-side thinking is visible instead of a silent bar. Once the first token arrives the same
+  counter carries over into the streaming display as the TTFT slot.
+- **While streaming**: `C115.0k T4.5k O8.2k ⇢1.3s ~45.3 TPS` — cached context, streamed thinking
+  tokens, cumulative output tokens, time to first token, and a sliding-window rate. The `O` and
+  `T` counters refresh on **every** delta; the rate figure updates at most once per second. Parts
+  that update in real time render in the accent color, frozen parts stay dim. While the stream is
+  younger than the window the rate is averaged over its actual span (a steady stream shows its
+  true speed from the first sample, no warm-up ramp); once the window is full a burst ages out
+  over exactly 3s. A delivery silence of one full window or more (hidden server-side reasoning,
+  buffering relays) starts a fresh measurement segment, so the rate right after a stall describes
+  the resumed stream, not the stall. Streaming counts are estimated from characters (providers
+  only report authoritative token usage at the end of a message); the `~` marks the rate as an
+  estimate. The `T` slot appears only while thinking content is actually streamed — hidden
+  reasoning stays invisible until the reliable end-of-message count.
+- **When idle**: `C115.0k T4.5k O8.2k ⇢1.2s 45.3TPS` (all dim) for the last assistant message —
+  cached context, thinking tokens, output tokens, TTFT and average decode speed. Reliable provider
+  data wins over estimates: cache comes from `usage.cacheRead + usage.cacheWrite` when reported
+  (otherwise the request-payload estimate), thinking from `usage.reasoning` when reported
+  (otherwise the streamed-thinking char estimate), output from `usage.output` (otherwise the char
+  estimate). The speed numerator is the **visible** output (`usage.output − usage.reasoning`):
+  tokens generated but never streamed (hidden reasoning) don't count. The average is suppressed
+  when the decode window is too short to measure a rate (< 500ms, e.g. whole-message burst
+  delivery) — a rate needs a minimum integration window.
 - **Unmeasurable slots show `N/A`** instead of a misleading number: unknown TTFT (no request
   anchor), speed below the measurement limits (burst flush, no visible tokens), or `N/A` alone
-  when nothing about a message could be measured.
+  when nothing about a message could be measured. Fields with neither reliable data nor an
+  estimate (e.g. `T` for a provider that neither streams thinking nor reports reasoning) are
+  omitted. Token counts scale as `980`, `12.3k`, `1.23M`.
 
 Estimation splits text into CJK and non-CJK characters. Default ratios were calibrated against
 ~22.5k real assistant messages (~15.6M output tokens) with `scripts/analyze-token-ratio.mjs`:

@@ -18,7 +18,7 @@ function feedCompleteMessage(
 	if (withAnchor) metrics.onRequestStart(T0 + 500);
 	metrics.onMessageStart(T0 + 900);
 	for (const at of deltas) {
-		metrics.onDelta("hello ", T0 + at);
+		metrics.onDelta("hello ", "text", T0 + at);
 	}
 	return metrics.onMessageEnd(options?.usage ?? { output: 20 }, "prov", "model", T0 + 5000, CALIBRATION);
 }
@@ -48,7 +48,7 @@ describe("StreamMetrics", () => {
 	it("falls back to message start when there is no request anchor", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0 + 1000);
-		metrics.onDelta("hi", T0 + 1500);
+		metrics.onDelta("hi", "text", T0 + 1500);
 		const stats = metrics.onMessageEnd({ output: 4 }, "prov", "model", T0 + 1600);
 		expect(stats?.ttftMs).toBe(500); // 1500 − 1000
 	});
@@ -57,7 +57,7 @@ describe("StreamMetrics", () => {
 		const metrics = new StreamMetrics();
 		metrics.onRequestStart(T0); // more than 60s before message start
 		metrics.onMessageStart(T0 + 120_000);
-		metrics.onDelta("hi", T0 + 120_500);
+		metrics.onDelta("hi", "text", T0 + 120_500);
 		const stats = metrics.onMessageEnd({ output: 4 }, "prov", "model", T0 + 120_600);
 		expect(stats?.ttftMs).toBe(500);
 	});
@@ -65,7 +65,7 @@ describe("StreamMetrics", () => {
 	it("uses authoritative usage over estimates at message end", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
-		metrics.onDelta("你好世界", T0 + 100); // 4 CJK chars → 4 tokens at 1.0 chars/token
+		metrics.onDelta("你好世界", "text", T0 + 100); // 4 CJK chars → 4 tokens at 1.0 chars/token
 		const stats = metrics.onMessageEnd({ output: 99, reasoning: 3 }, "prov", "model", T0 + 200, CALIBRATION);
 		expect(stats?.outputTokens).toBe(99);
 		expect(stats?.reasoningTokens).toBe(3);
@@ -75,7 +75,7 @@ describe("StreamMetrics", () => {
 	it("estimates tokens when usage is missing", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
-		metrics.onDelta("hello", T0 + 100);
+		metrics.onDelta("hello", "text", T0 + 100);
 		const stats = metrics.onMessageEnd(undefined, "prov", "model", T0 + 200, CALIBRATION);
 		expect(stats?.outputTokens).toBe(1); // 5/4 rounded
 		expect(stats?.reasoningTokens).toBe(0);
@@ -95,8 +95,8 @@ describe("StreamMetrics", () => {
 		const metrics = new StreamMetrics();
 		metrics.onRequestStart(T0);
 		metrics.onMessageStart(T0 + 100);
-		metrics.onDelta("x".repeat(1872), T0 + 19475);
-		metrics.onDelta(".", T0 + 19514); // last tail chunk
+		metrics.onDelta("x".repeat(1872), "text", T0 + 19475);
+		metrics.onDelta(".", "text", T0 + 19514); // last tail chunk
 		const stats = metrics.onMessageEnd({ output: 503 }, "prov", "model", T0 + 19530);
 		expect(stats?.ttftMs).toBe(19475);
 		expect(stats?.decodeMs).toBe(39);
@@ -108,22 +108,24 @@ describe("StreamMetrics", () => {
 		metrics.onRequestStart(T0);
 		metrics.onMessageStart(T0);
 		for (let i = 1; i <= 5; i++) {
-			metrics.onDelta("hello ", T0 + i * 500);
+			metrics.onDelta("hello ", "text", T0 + i * 500);
 		}
 		const stats = metrics.onMessageEnd({ output: 24 }, "prov", "model", T0 + 3100);
 		expect(stats?.decodeMs).toBe(2000);
 		expect(stats?.avgTps).toBe(12); // 24 tokens / 2s
 	});
 
-	it("liveSample needs a minimum elapsed time and nonzero estimate", () => {
+	it("liveSample needs a minimum elapsed time for the rate, counters work from the first delta", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
 		expect(metrics.liveSample(T0 + 1000)).toBeUndefined(); // no delta yet
 
-		metrics.onDelta("x", T0 + 500);
-		expect(metrics.liveSample(T0 + 600)).toBeUndefined(); // < 250ms since first delta
+		metrics.onDelta("x", "text", T0 + 500);
+		const young = metrics.liveSample(T0 + 600);
+		expect(young?.tps).toBeNull(); // < 250ms since first delta: no rate yet
+		expect(young?.estimatedTokens).toBeCloseTo(1 / 3.8, 5); // cumulative estimate still valid
 
-		metrics.onDelta("x".repeat(32), T0 + 600); // 33 chars total → ~8 tokens
+		metrics.onDelta("x".repeat(32), "text", T0 + 600); // 33 chars total → ~8 tokens
 		const sample = metrics.liveSample(T0 + 1500, CALIBRATION);
 		expect(sample?.elapsedMs).toBe(1000);
 		expect(sample?.ttftMs).toBe(500); // first delta − message start anchor
@@ -137,7 +139,7 @@ describe("StreamMetrics", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
 		for (let i = 0; i < 3; i++) {
-			metrics.onDelta("hello ", T0 + i * 500); // 12 chars/s = 3 tokens/s
+			metrics.onDelta("hello ", "text", T0 + i * 500); // 12 chars/s = 3 tokens/s
 		}
 		const sample = metrics.liveSample(T0 + 1500, CALIBRATION);
 		// Window holds all 1.5s of data → 4.5 tokens / 1.5s = 3 TPS (not 4.5/3 = 1.5).
@@ -148,7 +150,7 @@ describe("StreamMetrics", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
 		for (let i = 0; i <= 10; i++) {
-			metrics.onDelta("hello ", T0 + i * 500); // 12 chars/s = 3 tokens/s
+			metrics.onDelta("hello ", "text", T0 + i * 500); // 12 chars/s = 3 tokens/s
 		}
 		const sample = metrics.liveSample(T0 + 5000, CALIBRATION);
 		// Window covers the last 3s exactly: 6 deltas × 6 chars = 36 chars = 9 tokens.
@@ -159,7 +161,7 @@ describe("StreamMetrics", () => {
 		const metrics = new StreamMetrics();
 		metrics.onRequestStart(T0);
 		metrics.onMessageStart(T0);
-		metrics.onDelta("x".repeat(1872), T0 + 19475); // everything at once after 19.5s
+		metrics.onDelta("x".repeat(1872), "text", T0 + 19475); // everything at once after 19.5s
 		const sample = metrics.liveSample(T0 + 19775, CALIBRATION);
 		expect(sample?.ttftMs).toBe(19475);
 		expect(sample?.tps).toBe(1560); // 468 tokens over the observed 0.3s span
@@ -168,9 +170,9 @@ describe("StreamMetrics", () => {
 	it("liveSample recovers exactly after the window slides past a burst", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
-		metrics.onDelta("x".repeat(1872), T0 + 19475);
+		metrics.onDelta("x".repeat(1872), "text", T0 + 19475);
 		for (let i = 0; i <= 6; i++) {
-			metrics.onDelta("hello ", T0 + 20000 + i * 500); // steady 3 tokens/s
+			metrics.onDelta("hello ", "text", T0 + 20000 + i * 500); // steady 3 tokens/s
 		}
 		const sample = metrics.liveSample(T0 + 23000, CALIBRATION);
 		expect(sample?.tps).toBe(3);
@@ -179,8 +181,8 @@ describe("StreamMetrics", () => {
 	it("liveSample starts a fresh measurement segment after a delivery gap of one window", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
-		metrics.onDelta("x".repeat(380), T0 + 1000); // 100 tokens, then a 9s stall
-		metrics.onDelta("xx", T0 + 10000); // trickle resumes
+		metrics.onDelta("x".repeat(380), "text", T0 + 1000); // 100 tokens, then a 9s stall
+		metrics.onDelta("xx", "text", T0 + 10000); // trickle resumes
 		const sample = metrics.liveSample(T0 + 10250, CALIBRATION);
 		// Segment restarted at the first post-gap delta: 0.5 tokens over 0.25s.
 		// Without the reset the 3s denominator would span the stall → ~0.17 TPS.
@@ -191,8 +193,8 @@ describe("StreamMetrics", () => {
 	it("liveSample keeps the window across gaps smaller than one window span", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
-		metrics.onDelta("x".repeat(380), T0 + 1000); // 100 tokens
-		metrics.onDelta("xx", T0 + 3000); // 2s gap (< 3s window): no segment reset
+		metrics.onDelta("x".repeat(380), "text", T0 + 1000); // 100 tokens
+		metrics.onDelta("xx", "text", T0 + 3000); // 2s gap (< 3s window): no segment reset
 		const sample = metrics.liveSample(T0 + 3250, CALIBRATION);
 		expect(sample?.elapsedMs).toBe(2250);
 		expect(sample?.tps).toBeCloseTo(95.5 / 2.25, 5); // 380 chars + "xx" over the 2.25s span
@@ -201,9 +203,9 @@ describe("StreamMetrics", () => {
 	it("onDelta ignores empty deltas", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
-		metrics.onDelta("", T0 + 100);
+		metrics.onDelta("", "text", T0 + 100);
 		expect(metrics.liveSample(T0 + 2000, CALIBRATION)).toBeUndefined(); // nothing anchored
-		metrics.onDelta("x".repeat(8), T0 + 300);
+		metrics.onDelta("x".repeat(8), "text", T0 + 300);
 		const sample = metrics.liveSample(T0 + 560, CALIBRATION);
 		expect(sample?.ttftMs).toBe(300); // anchored at the first non-empty delta
 	});
@@ -211,7 +213,7 @@ describe("StreamMetrics", () => {
 	it("liveSample uses authoritative partial usage only for the cumulative estimate", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
-		metrics.onDelta("x", T0 + 100);
+		metrics.onDelta("x", "text", T0 + 100);
 		const sample = metrics.liveSample(T0 + 1100, CALIBRATION, 42);
 		expect(sample?.estimatedTokens).toBe(42);
 		expect(sample?.tps).toBeCloseTo(0.25, 5); // 1 char → 0.25 tokens over the observed 1.0s
@@ -220,9 +222,82 @@ describe("StreamMetrics", () => {
 	it("reset clears everything including restored stats", () => {
 		const metrics = new StreamMetrics();
 		feedCompleteMessage(metrics);
+		metrics.setRequestContext(1234);
 		metrics.reset();
 		expect(metrics.stats).toBeUndefined();
 		expect(metrics.liveSample(T0 + 9999)).toBeUndefined();
+		expect(metrics.cacheTokensEstimate).toBeNull();
+	});
+
+	it("liveSample reports streamed thinking and the request context estimate", () => {
+		const metrics = new StreamMetrics();
+		metrics.setRequestContext(115_000);
+		metrics.onMessageStart(T0);
+		metrics.onDelta("思考", "thinking", T0 + 100); // 2 CJK chars → 2 tokens
+		metrics.onDelta("hello ", "text", T0 + 600); // 6 chars → 1.5 tokens
+		const sample = metrics.liveSample(T0 + 1100, CALIBRATION);
+		expect(sample?.estimatedThinkingTokens).toBe(2);
+		expect(sample?.cacheTokens).toBe(115_000);
+		expect(sample?.estimatedTokens).toBeCloseTo(3.5, 5); // thinking + text
+	});
+
+	it("liveSample omits thinking and context when neither is known", () => {
+		const metrics = new StreamMetrics();
+		metrics.onMessageStart(T0);
+		metrics.onDelta("hello ", "text", T0 + 100);
+		const sample = metrics.liveSample(T0 + 600, CALIBRATION);
+		expect(sample?.estimatedThinkingTokens).toBeNull();
+		expect(sample?.cacheTokens).toBeNull();
+	});
+
+	it("onMessageEnd prefers reported cacheRead/cacheWrite over the request estimate", () => {
+		const metrics = new StreamMetrics();
+		metrics.setRequestContext(115_000);
+		metrics.onMessageStart(T0);
+		metrics.onDelta("hello ", "text", T0 + 100);
+		const stats = metrics.onMessageEnd(
+			{ output: 10, cacheRead: 1000, cacheWrite: 200 },
+			"prov",
+			"model",
+			T0 + 200,
+			CALIBRATION,
+		);
+		expect(stats?.cacheTokens).toBe(1200);
+		expect(stats?.cacheEstimated).toBe(false);
+	});
+
+	it("onMessageEnd falls back to the request estimate without reported cache", () => {
+		const metrics = new StreamMetrics();
+		metrics.setRequestContext(900);
+		metrics.onMessageStart(T0);
+		metrics.onDelta("思考", "thinking", T0 + 100);
+		const estimated = metrics.onMessageEnd({ output: 10 }, "prov", "model", T0 + 200, CALIBRATION);
+		expect(estimated?.cacheTokens).toBe(900);
+		expect(estimated?.cacheEstimated).toBe(true);
+		// Streamed thinking was recorded as an estimate; reasoning was not reported.
+		expect(estimated?.reasoningTokens).toBe(0);
+		expect(estimated?.thinkingEstimatedTokens).toBe(2);
+
+		// Reported reasoning is the reliable count; reported zero cache still
+		// falls back to the request estimate.
+		const reliable = metrics.onMessageEnd(
+			{ output: 10, reasoning: 7, cacheRead: 0, cacheWrite: 0 },
+			"prov",
+			"model",
+			T0 + 300,
+			CALIBRATION,
+		);
+		expect(reliable?.reasoningTokens).toBe(7);
+		expect(reliable?.cacheTokens).toBe(900);
+		expect(reliable?.cacheEstimated).toBe(true);
+
+		// Without any request context and without reported cache there is no data.
+		const bare = new StreamMetrics();
+		bare.onMessageStart(T0);
+		bare.onDelta("x", "text", T0 + 100);
+		const noCache = bare.onMessageEnd({ output: 3, cacheRead: 0, cacheWrite: 0 }, "prov", "model", T0 + 200);
+		expect(noCache?.cacheTokens).toBeUndefined();
+		expect(noCache?.cacheEstimated).toBeUndefined();
 	});
 });
 
@@ -269,6 +344,32 @@ describe("parseLastStats", () => {
 		expect(parsed?.reasoningTokens).toBe(2);
 	});
 
+	it("parses optional thinking and cache fields and ignores garbage", () => {
+		const base = {
+			provider: "p",
+			model: "m",
+			ttftMs: 500,
+			decodeMs: 2000,
+			avgTps: 5,
+			outputTokens: 10,
+			reasoningTokens: 0,
+			estimated: false,
+			chars: { cjk: 0, nonCjk: 40 },
+			endedAt: 1,
+		};
+		const parsed = parseLastStats({ ...base, thinkingEstimatedTokens: 30, cacheTokens: 1200, cacheEstimated: true });
+		expect(parsed?.thinkingEstimatedTokens).toBe(30);
+		expect(parsed?.cacheTokens).toBe(1200);
+		expect(parsed?.cacheEstimated).toBe(true);
+		const legacy = parseLastStats(base);
+		expect(legacy?.thinkingEstimatedTokens).toBeUndefined();
+		expect(legacy?.cacheTokens).toBeUndefined();
+		expect(legacy?.cacheEstimated).toBeUndefined();
+		const garbage = parseLastStats({ ...base, cacheTokens: "many", thinkingEstimatedTokens: -5 });
+		expect(garbage?.cacheTokens).toBeUndefined();
+		expect(garbage?.thinkingEstimatedTokens).toBeUndefined();
+	});
+
 	it("rejects malformed payloads", () => {
 		expect(parseLastStats(undefined)).toBeUndefined();
 		expect(parseLastStats(null)).toBeUndefined();
@@ -306,7 +407,7 @@ describe("parseLastStats", () => {
 	it("round-trips null fields", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
-		metrics.onDelta("x", T0 + 100);
+		metrics.onDelta("x", "text", T0 + 100);
 		const stats = metrics.onMessageEnd({ output: 3 }, "prov", "model", T0 + 150);
 		const parsed = parseLastStats(JSON.parse(JSON.stringify(stats)));
 		expect(parsed?.decodeMs).toBe(0);

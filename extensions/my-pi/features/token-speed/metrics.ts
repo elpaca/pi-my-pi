@@ -22,18 +22,37 @@ export interface LastMessageStats {
 	reasoningTokens: number;
 	/** True when outputTokens is estimated from characters (no authoritative usage). */
 	estimated: boolean;
+	/**
+	 * Estimated tokens of thinking content that was actually streamed (visible
+	 * thinking), char-based. Undefined when nothing was streamed or in legacy
+	 * entries. Reliable thinking counts live in `reasoningTokens`.
+	 */
+	thinkingEstimatedTokens?: number;
+	/**
+	 * Cached-context tokens: cacheRead + cacheWrite when the provider reports
+	 * them (cacheEstimated false), else the request-context estimate
+	 * (cacheEstimated true). Undefined when neither is available.
+	 */
+	cacheTokens?: number;
+	cacheEstimated?: boolean;
 	chars: CharCounts;
 	endedAt: number;
 }
 
 /** A point-in-time sample of the currently streaming message. */
 export interface LiveSample {
+	/** Estimated cumulative visible output tokens (text + thinking + toolcall). */
 	estimatedTokens: number;
+	/** Estimated thinking tokens streamed so far; null while no thinking deltas arrived. */
+	estimatedThinkingTokens: number | null;
+	/** Estimated cached-context tokens for the current request; null when unknown. */
+	cacheTokens: number | null;
 	/** Time to first delta, ms; null when no request/message anchor exists. */
 	ttftMs: number | null;
-	/** Elapsed time since the first delta, ms. */
+	/** Elapsed time since the start of the current measurement segment, ms. */
 	elapsedMs: number;
-	tps: number;
+	/** Window rate; null while the window is younger than MIN_LIVE_ELAPSED_MS. */
+	tps: number | null;
 }
 
 /** Display warm-up: don't flash a live rate for messages that finish almost instantly. */
@@ -72,7 +91,10 @@ export class StreamMetrics {
 	private firstDeltaMs: number | null = null;
 	private lastDeltaMs: number | null = null;
 	private chars: CharCounts = { cjk: 0, nonCjk: 0 };
+	private thinkingChars: CharCounts = { cjk: 0, nonCjk: 0 };
 	private hasDelta = false;
+	/** Estimated cached-context tokens of the current request; set per request, survives message starts. */
+	private requestCacheTokens: number | null = null;
 	/**
 	 * Start of the current live measurement segment: the first delta, or the
 	 * first delta after a delivery gap of at least LIVE_WINDOW_MS (a stall —
@@ -92,7 +114,9 @@ export class StreamMetrics {
 		this.firstDeltaMs = null;
 		this.lastDeltaMs = null;
 		this.chars = { cjk: 0, nonCjk: 0 };
+		this.thinkingChars = { cjk: 0, nonCjk: 0 };
 		this.hasDelta = false;
+		this.requestCacheTokens = null;
 		this.liveAnchorMs = null;
 		this.segmentBase = { cjk: 0, nonCjk: 0 };
 		this.charLog = [];
@@ -108,25 +132,40 @@ export class StreamMetrics {
 		return this.lastStats;
 	}
 
+	/**
+	 * Estimated cached-context size of the outgoing request (computed by the
+	 * caller from the request payload). Null when the payload carried nothing
+	 * countable. Stays stable for the whole request so the wait counter and
+	 * the live display agree.
+	 */
+	setRequestContext(tokens: number | null): void {
+		this.requestCacheTokens = tokens;
+	}
+
+	get cacheTokensEstimate(): number | null {
+		return this.requestCacheTokens;
+	}
+
 	/** Anchor the start of a provider request. Fired before each LLM call. */
 	onRequestStart(now: number): void {
 		this.requestStartMs = now;
 	}
 
-	/** A new assistant message is about to stream. Resets per-message counters but keeps the request anchor. */
+	/** A new assistant message is about to stream. Resets per-message counters but keeps the request anchor and context. */
 	onMessageStart(now: number): void {
 		this.messageStartMs = now;
 		this.firstDeltaMs = null;
 		this.lastDeltaMs = null;
 		this.chars = { cjk: 0, nonCjk: 0 };
+		this.thinkingChars = { cjk: 0, nonCjk: 0 };
 		this.hasDelta = false;
 		this.liveAnchorMs = null;
 		this.segmentBase = { cjk: 0, nonCjk: 0 };
 		this.charLog = [];
 	}
 
-	/** Account one streamed delta of any kind (text / thinking / toolcall). */
-	onDelta(text: string, now: number): void {
+	/** Account one streamed delta. Kind separates visible thinking from other output. */
+	onDelta(text: string, kind: "text" | "thinking" | "toolcall", now: number): void {
 		if (text.length === 0) return; // degenerate event: no content, no timing
 		if (!this.hasDelta) {
 			this.firstDeltaMs = now;
@@ -145,6 +184,10 @@ export class StreamMetrics {
 		const counts = countChars(text);
 		this.chars.cjk += counts.cjk;
 		this.chars.nonCjk += counts.nonCjk;
+		if (kind === "thinking") {
+			this.thinkingChars.cjk += counts.cjk;
+			this.thinkingChars.nonCjk += counts.nonCjk;
+		}
 		this.charLog.push({ t: now, cjk: this.chars.cjk, nonCjk: this.chars.nonCjk });
 		// Keep at most one entry at or before the window start; it serves as the baseline.
 		while (this.charLog.length >= 2 && (this.charLog[1]?.t ?? Infinity) <= now - LIVE_WINDOW_MS) {
@@ -164,7 +207,6 @@ export class StreamMetrics {
 	liveSample(now: number, calibration?: Calibration, authoritativeTokens = 0): LiveSample | undefined {
 		if (this.firstDeltaMs === null || this.liveAnchorMs === null || this.charLog.length === 0) return undefined;
 		const elapsedMs = now - this.liveAnchorMs;
-		if (elapsedMs < MIN_LIVE_ELAPSED_MS) return undefined;
 		const last = this.charLog[this.charLog.length - 1];
 		if (!last) return undefined;
 		const cutoff = now - LIVE_WINDOW_MS;
@@ -182,14 +224,21 @@ export class StreamMetrics {
 			}
 		}
 		const windowTokens = estimateTokens({ cjk: last.cjk - baseCjk, nonCjk: last.nonCjk - baseNonCjk }, calibration);
-		if (!(windowTokens > 0)) return undefined;
 		const anchor = this.resolveRequestStart();
-		const windowMs = Math.min(elapsedMs, LIVE_WINDOW_MS);
+		// The rate needs a minimum integration window; the cumulative counters
+		// (C/T/O) are valid from the first delta on.
+		const tps =
+			elapsedMs >= MIN_LIVE_ELAPSED_MS && windowTokens > 0
+				? windowTokens / (Math.min(elapsedMs, LIVE_WINDOW_MS) / 1000)
+				: null;
 		return {
 			estimatedTokens: Math.max(estimateTokens(this.chars, calibration), authoritativeTokens),
+			estimatedThinkingTokens:
+				countTotalChars(this.thinkingChars) > 0 ? estimateTokens(this.thinkingChars, calibration) : null,
+			cacheTokens: this.requestCacheTokens,
 			ttftMs: anchor !== null ? Math.max(0, this.firstDeltaMs - anchor) : null,
 			elapsedMs,
-			tps: windowTokens / (windowMs / 1000),
+			tps,
 		};
 	}
 
@@ -198,7 +247,7 @@ export class StreamMetrics {
 	 * nothing to report (no deltas, no authoritative tokens, no chars).
 	 */
 	onMessageEnd(
-		usage: { output: number; reasoning?: number } | undefined,
+		usage: { output: number; cacheRead?: number; cacheWrite?: number; reasoning?: number } | undefined,
 		provider: string,
 		model: string,
 		now: number,
@@ -224,6 +273,25 @@ export class StreamMetrics {
 		const avgTps =
 			decodeMs !== null && decodeMs >= MIN_DECODE_MS && visibleTokens > 0 ? visibleTokens / (decodeMs / 1000) : null;
 
+		// Cached context: provider-reported cacheRead/cacheWrite is authoritative;
+		// otherwise fall back to the request-payload estimate computed at request time.
+		const cacheRead = Number.isFinite(usage?.cacheRead) ? Math.max(0, usage?.cacheRead ?? 0) : 0;
+		const cacheWrite = Number.isFinite(usage?.cacheWrite) ? Math.max(0, usage?.cacheWrite ?? 0) : 0;
+		const cacheSum = cacheRead + cacheWrite;
+		let cacheTokens: number | undefined;
+		let cacheEstimated: boolean | undefined;
+		if (cacheSum > 0) {
+			cacheTokens = cacheSum;
+			cacheEstimated = false;
+		} else if (this.requestCacheTokens !== null && this.requestCacheTokens > 0) {
+			cacheTokens = this.requestCacheTokens;
+			cacheEstimated = true;
+		}
+		// Visible thinking is measured from streamed thinking deltas; only shown
+		// when the provider did not report an authoritative reasoning count.
+		const thinkingEstimatedTokens =
+			countTotalChars(this.thinkingChars) > 0 ? Math.round(estimateTokens(this.thinkingChars, calibration)) : undefined;
+
 		const stats: LastMessageStats = {
 			provider,
 			model,
@@ -233,6 +301,9 @@ export class StreamMetrics {
 			outputTokens,
 			reasoningTokens,
 			estimated: !hasAuthoritative,
+			thinkingEstimatedTokens,
+			cacheTokens,
+			cacheEstimated,
 			chars: { ...this.chars },
 			endedAt: now,
 		};
@@ -265,6 +336,9 @@ export function parseLastStats(data: unknown): LastMessageStats | undefined {
 	const chars = d.chars as Record<string, unknown> | undefined;
 	if (!chars || !num(chars.cjk) || !num(chars.nonCjk)) return undefined;
 	const reasoningTokens = num(d.reasoningTokens) ? d.reasoningTokens : 0;
+	const optNum = (value: unknown): number | undefined => (num(value) && value >= 0 ? value : undefined);
+	const thinkingEstimatedTokens = optNum(d.thinkingEstimatedTokens);
+	const cacheTokens = optNum(d.cacheTokens);
 	const stats: LastMessageStats = {
 		provider: d.provider,
 		model: d.model,
@@ -274,6 +348,8 @@ export function parseLastStats(data: unknown): LastMessageStats | undefined {
 		outputTokens: d.outputTokens,
 		reasoningTokens,
 		estimated: d.estimated,
+		...(thinkingEstimatedTokens !== undefined ? { thinkingEstimatedTokens } : {}),
+		...(cacheTokens !== undefined ? { cacheTokens, cacheEstimated: d.cacheEstimated === true } : {}),
 		chars: { cjk: chars.cjk, nonCjk: chars.nonCjk },
 		endedAt: d.endedAt,
 	};

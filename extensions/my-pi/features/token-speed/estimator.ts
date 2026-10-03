@@ -63,6 +63,39 @@ export function countTotalChars(counts: CharCounts): number {
 	return counts.cjk + counts.nonCjk;
 }
 
+const BASE64_PATTERN = /^[A-Za-z0-9+/=]+$/;
+
+/** Base64 blobs (inline images) and data URLs carry no usable char→token signal. */
+function isBinaryText(text: string): boolean {
+	return text.startsWith("data:") || (text.length > 1024 && BASE64_PATTERN.test(text));
+}
+
+/**
+ * Sum CJK vs non-CJK chars over every string value of a provider request
+ * payload (whatever `before_provider_request` carries: Anthropic-style
+ * `{system, messages, tools}` or OpenAI-style `{messages, tools}`). Object
+ * keys are ignored; image data is skipped. This is the raw material for the
+ * estimated cached-context size of a request.
+ */
+export function countPayloadChars(payload: unknown): CharCounts {
+	const total: CharCounts = { cjk: 0, nonCjk: 0 };
+	const visit = (value: unknown): void => {
+		if (typeof value === "string") {
+			if (!isBinaryText(value)) {
+				const counts = countChars(value);
+				total.cjk += counts.cjk;
+				total.nonCjk += counts.nonCjk;
+			}
+		} else if (Array.isArray(value)) {
+			for (const item of value) visit(item);
+		} else if (value !== null && typeof value === "object") {
+			for (const item of Object.values(value)) visit(item);
+		}
+	};
+	visit(payload);
+	return total;
+}
+
 /** Estimate token count from character counts using the given calibration. */
 export function estimateTokens(counts: CharCounts, calibration: Calibration = DEFAULT_CALIBRATION): number {
 	const cjkRatio =

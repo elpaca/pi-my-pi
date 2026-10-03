@@ -2,9 +2,15 @@ import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Feature } from "../../types.ts";
 import { CalibrationCache, calibrationKey } from "./calibration.ts";
-import { type Calibration, countTotalChars } from "./estimator.ts";
-import { formatIdleStats, formatStreamingStats, formatWaitElapsed } from "./format.ts";
-import { parseLastStats, StreamMetrics } from "./metrics.ts";
+import {
+	type Calibration,
+	countPayloadChars,
+	countTotalChars,
+	DEFAULT_CALIBRATION,
+	estimateTokens,
+} from "./estimator.ts";
+import { formatIdleSegments, formatStreamingSegments, formatWaitSegments, type StatusSegment } from "./format.ts";
+import { type LiveSample, parseLastStats, StreamMetrics } from "./metrics.ts";
 
 const STATUS_KEY = "my-pi";
 const CUSTOM_TYPE = "my-pi.token-speed";
@@ -13,12 +19,16 @@ const LIVE_UPDATE_INTERVAL_MS = 1000;
 /** Tick rate of the wait-phase elapsed counter (no stream events fire before the first delta). */
 const WAIT_TICK_MS = 100;
 
-function extractDelta(event: AssistantMessageEvent): string | undefined {
+type DeltaKind = "text" | "thinking" | "toolcall";
+
+function extractDelta(event: AssistantMessageEvent): { text: string; kind: DeltaKind } | undefined {
 	switch (event.type) {
 		case "text_delta":
+			return { text: event.delta, kind: "text" };
 		case "thinking_delta":
+			return { text: event.delta, kind: "thinking" };
 		case "toolcall_delta":
-			return event.delta;
+			return { text: event.delta, kind: "toolcall" };
 		default:
 			return undefined;
 	}
@@ -48,6 +58,7 @@ export const tokenSpeedFeature: Feature = {
 
 		let lastCtx: ExtensionContext | undefined;
 		let lastLiveUpdateMs = 0;
+		let lastSample: LiveSample | undefined;
 		let persistedEndedAt = 0;
 
 		const isEnabled = (): boolean => settings.getBoolean("tokenSpeed.enabled");
@@ -58,6 +69,10 @@ export const tokenSpeedFeature: Feature = {
 		const clearStatus = (ctx: ExtensionContext): void => {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 		};
+
+		/** Segments that update in real time highlight; static ones stay dim. */
+		const renderSegments = (ctx: ExtensionContext, segments: StatusSegment[]): string =>
+			segments.map((segment) => ctx.ui.theme.fg(segment.live ? "accent" : "dim", segment.text)).join(" ");
 
 		/** Tear down the wait-phase ticker; safe to call repeatedly. */
 		const stopWaitTimer = (): void => {
@@ -80,19 +95,22 @@ export const tokenSpeedFeature: Feature = {
 					clearStatus(ctx);
 					return;
 				}
-				ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", formatWaitElapsed(Date.now() - anchorMs)));
+				ctx.ui.setStatus(
+					STATUS_KEY,
+					renderSegments(ctx, formatWaitSegments(Date.now() - anchorMs, metrics.cacheTokensEstimate)),
+				);
 			}, WAIT_TICK_MS);
 		};
 
 		const renderIdle = (ctx: ExtensionContext): void => {
 			if (!isEnabled()) return;
 			const stats = metrics.stats;
-			const text = stats ? formatIdleStats(stats) : undefined;
-			if (!text) {
+			const segments = stats ? formatIdleSegments(stats) : [];
+			if (segments.length === 0) {
 				clearStatus(ctx);
 				return;
 			}
-			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("dim", text));
+			ctx.ui.setStatus(STATUS_KEY, renderSegments(ctx, segments));
 		};
 
 		const renderLive = (
@@ -103,22 +121,44 @@ export const tokenSpeedFeature: Feature = {
 		): void => {
 			if (!isEnabled() || !showDuringStream()) return;
 			const sample = metrics.liveSample(now, calibration, partialUsage);
-			if (!sample) return;
-			if (now - lastLiveUpdateMs < LIVE_UPDATE_INTERVAL_MS) return;
-			lastLiveUpdateMs = now;
-			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", formatStreamingStats(sample)));
+			if (!sample) return; // no deltas yet: the wait counter still owns the status
+			const rateJustBecameMeasurable = lastSample !== undefined && lastSample.tps === null && sample.tps !== null;
+			if (
+				!lastSample ||
+				lastLiveUpdateMs === 0 ||
+				rateJustBecameMeasurable ||
+				now - lastLiveUpdateMs >= LIVE_UPDATE_INTERVAL_MS
+			) {
+				lastSample = sample;
+				lastLiveUpdateMs = now;
+			}
+			// Token counters (C/T/O) refresh on every delta; ttft and the window
+			// rate come from the throttled sample so the speed figure stays put.
+			const throttled = lastSample;
+			const shown: LiveSample = { ...sample, ttftMs: throttled.ttftMs, tps: throttled.tps };
+			ctx.ui.setStatus(STATUS_KEY, renderSegments(ctx, formatStreamingSegments(shown)));
 		};
 
-		pi.on("before_provider_request", (_event, ctx) => {
+		pi.on("before_provider_request", (event, ctx) => {
 			lastCtx = ctx;
 			const now = Date.now();
 			metrics.onRequestStart(now);
+			// Estimate the cached-context size from the outgoing payload once per
+			// request, with the same calibration the live display will use.
+			const model = ctx.model;
+			const calibration = model ? cache.get(calibrationKey(model.provider, model.id)) : undefined;
+			const chars = countPayloadChars(event.payload);
+			metrics.setRequestContext(
+				countTotalChars(chars) > 0 ? Math.round(estimateTokens(chars, calibration ?? DEFAULT_CALIBRATION)) : null,
+			);
 			startWaitTimer(ctx, now);
 		});
 
 		pi.on("message_start", (event, ctx) => {
 			lastCtx = ctx;
 			if (event.message.role !== "assistant") return;
+			lastSample = undefined;
+			lastLiveUpdateMs = 0;
 			metrics.onMessageStart(Date.now());
 		});
 
@@ -134,7 +174,7 @@ export const tokenSpeedFeature: Feature = {
 					stopWaitTimer();
 					lastLiveUpdateMs = 0; // render the first live sample immediately
 				}
-				metrics.onDelta(delta, now);
+				metrics.onDelta(delta.text, delta.kind, now);
 			}
 			const key = calibrationKey(message.provider, message.model);
 			renderLive(ctx, now, cache.get(key), message.usage?.output ?? 0);
