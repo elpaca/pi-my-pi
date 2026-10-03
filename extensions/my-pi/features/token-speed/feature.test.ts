@@ -373,6 +373,33 @@ describe("token-speed feature wiring", () => {
 		expect(h.statuses.get("my-pi")).toBe("I1.2k F0.1s T100 O200 182TPS");
 	});
 
+	it("never shows O while only thinking has streamed, even with mid-stream usage", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request");
+		h.emit("message_start", { message: assistantMessage() });
+		// Providers like Anthropic report usage.output cumulatively including
+		// hidden thinking while streaming; O must not follow T.
+		vi.setSystemTime(START + 200);
+		h.emit("message_update", {
+			message: assistantMessage({ usage: { output: 100 } }),
+			assistantMessageEvent: { type: "thinking_delta", delta: "思".repeat(130) },
+		});
+		expect(h.statuses.get("my-pi")).toBe("F0.2s T100");
+		vi.setSystemTime(START + 400);
+		h.emit("message_update", {
+			message: assistantMessage({ usage: { output: 300 } }),
+			assistantMessageEvent: { type: "thinking_delta", delta: "思".repeat(260) },
+		});
+		expect(h.statuses.get("my-pi")).toBe("F0.2s T300");
+		// First non-thinking delta: O appears from the streamed chars.
+		vi.setSystemTime(START + 1200);
+		h.emit("message_update", {
+			message: assistantMessage({ usage: { output: 350 } }),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(10) },
+		});
+		expect(h.statuses.get("my-pi")).toBe("F0.2s T300 O3 ~303 TPS");
+	});
+
 	it("shows the previous message's average speed while waiting for the first token", () => {
 		const h = registerFeature();
 		h.emit("before_provider_request");

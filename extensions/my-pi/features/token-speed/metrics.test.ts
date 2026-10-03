@@ -210,13 +210,26 @@ describe("StreamMetrics", () => {
 		expect(sample?.ttftMs).toBe(300); // anchored at the first non-empty delta
 	});
 
-	it("liveSample uses authoritative partial usage only for the cumulative estimate", () => {
+	it("liveSample uses authoritative partial usage only for the rate numerator, never for O", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
 		metrics.onDelta("x", "text", T0 + 100);
 		const sample = metrics.liveSample(T0 + 1100, CALIBRATION, 42);
 		expect(sample?.estimatedTokens).toBe(42);
-		expect(sample?.tps).toBeCloseTo(0.25, 5); // 1 char → 0.25 tokens over the observed 1.0s
+		expect(sample?.estimatedOutputTokens).toBeCloseTo(0.25, 5); // 1 char → 0.25 tokens
+		expect(sample?.tps).toBeCloseTo(0.25, 5); // over the observed 1.0s
+	});
+
+	it("liveSample never counts mid-stream output usage as O while only thinking streamed", () => {
+		const metrics = new StreamMetrics();
+		metrics.onMessageStart(T0);
+		metrics.onDelta("思考", "thinking", T0 + 100); // 2 CJK chars → 2 tokens
+		// Anthropic-style providers report usage.output cumulatively including
+		// hidden thinking; O must stay at the char estimate (zero text deltas).
+		const sample = metrics.liveSample(T0 + 1100, CALIBRATION, 438);
+		expect(sample?.estimatedTokens).toBe(438); // rate numerator floors to usage
+		expect(sample?.estimatedThinkingTokens).toBe(2);
+		expect(sample?.estimatedOutputTokens).toBe(0);
 	});
 
 	it("reset clears everything including restored stats", () => {

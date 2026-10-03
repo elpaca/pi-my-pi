@@ -44,7 +44,13 @@ export interface LastMessageStats {
 export interface LiveSample {
 	/** Estimated cumulative generated tokens (text + thinking + toolcall); the rate numerator. */
 	estimatedTokens: number;
-	/** Estimated cumulative non-thinking output tokens (text + toolcall); the O slot. */
+	/**
+	 * Estimated cumulative non-thinking output tokens (text + toolcall); the O
+	 * slot. Derived from the streamed deltas only — mid-stream usage.output
+	 * mixes in hidden thinking for providers that count it as output (and
+	 * reasoning is not reliably reported mid-stream), so authoritative data
+	 * would put thinking into O before any visible output exists.
+	 */
 	estimatedOutputTokens: number;
 	/** Estimated thinking tokens streamed so far; null while no thinking deltas arrived. */
 	estimatedThinkingTokens: number | null;
@@ -212,14 +218,10 @@ export class StreamMetrics {
 	 * warm-up ramp. Because the estimator is linear in char counts, the window
 	 * content is computed exactly from char deltas. `authoritativeTokens`
 	 * (partial usage.output from the provider, when available) only floors the
-	 * reported cumulative estimate.
+	 * reported cumulative rate numerator — never the O slot, which stays a
+	 * pure non-thinking char estimate.
 	 */
-	liveSample(
-		now: number,
-		calibration?: Calibration,
-		authoritativeTokens = 0,
-		authoritativeReasoningTokens = 0,
-	): LiveSample | undefined {
+	liveSample(now: number, calibration?: Calibration, authoritativeTokens = 0): LiveSample | undefined {
 		if (this.firstDeltaMs === null || this.liveAnchorMs === null || this.charLog.length === 0) return undefined;
 		const elapsedMs = now - this.liveAnchorMs;
 		const last = this.charLog[this.charLog.length - 1];
@@ -246,14 +248,15 @@ export class StreamMetrics {
 			elapsedMs >= MIN_LIVE_ELAPSED_MS && windowTokens > 0
 				? windowTokens / (Math.min(elapsedMs, LIVE_WINDOW_MS) / 1000)
 				: null;
-		// The O slot counts non-thinking output only; the authoritative floor
-		// subtracts reported reasoning for the same reason (reasoning is a subset
-		// of output). When reasoning is not reported the floor may include hidden
-		// reasoning — provider data still wins over the char estimate.
-		const visibleFloor = Math.max(0, authoritativeTokens - authoritativeReasoningTokens);
+		// The O slot counts non-thinking output only, measured from the deltas
+		// actually received. Mid-stream usage.output includes hidden thinking for
+		// several providers while reasoning is not reliably reported mid-stream,
+		// so an authoritative floor here would surface thinking as O during the
+		// thinking phase (the T438 O438 bug). Hidden reasoning stays invisible
+		// until the reliable end-of-message split.
 		return {
 			estimatedTokens: Math.max(estimateTokens(this.chars, calibration), authoritativeTokens),
-			estimatedOutputTokens: Math.max(estimateTokens(this.outputChars, calibration), visibleFloor),
+			estimatedOutputTokens: estimateTokens(this.outputChars, calibration),
 			estimatedThinkingTokens:
 				countTotalChars(this.thinkingChars) > 0 ? estimateTokens(this.thinkingChars, calibration) : null,
 			inputTokens: this.requestInputTokens,
