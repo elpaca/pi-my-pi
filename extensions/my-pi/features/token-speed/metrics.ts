@@ -8,10 +8,18 @@ export interface LastMessageStats {
 	ttftMs: number | null;
 	/** Duration from first to last delta, in ms. */
 	decodeMs: number | null;
-	/** outputTokens / decode seconds. Null when decode duration is unknown. */
+	/**
+	 * Average decode speed over the visible stream: visible output tokens
+	 * (usage.output minus unstreamed reasoning) divided by the decode window.
+	 * Null when the decode window is too short to measure a rate
+	 * (< MIN_DECODE_MS). TTFT is waiting time, not producing time, so it is
+	 * never part of the denominator.
+	 */
 	avgTps: number | null;
-	/** Authoritative usage.output, or an estimate when usage was unavailable. */
+	/** Authoritative usage.output (including hidden reasoning), or an estimate when usage was unavailable. */
 	outputTokens: number;
+	/** Reasoning tokens the provider generated but never streamed (hidden reasoning). */
+	reasoningTokens: number;
 	/** True when outputTokens is estimated from characters (no authoritative usage). */
 	estimated: boolean;
 	chars: CharCounts;
@@ -26,8 +34,27 @@ export interface LiveSample {
 	tps: number;
 }
 
-/** Streams produce their first delta quickly; before that the TPS estimate is pure noise. */
+/** Display warm-up: don't flash a live rate for messages that finish almost instantly. */
 export const MIN_LIVE_ELAPSED_MS = 250;
+
+/**
+ * Span of the sliding window behind the live rate, with a fixed denominator —
+ * the standard "recent speed" readout of progress UIs and bandwidth monitors.
+ * A burst of N tokens arriving at once can lift the rate by at most
+ * N / LIVE_WINDOW_MS, so burst delivery (hidden reasoning followed by a
+ * instant flush, buffering relays) stays bounded instead of producing a
+ * tokens-per-39ms absurdity. The window is exact for steady streams and ramps
+ * up during the first span (normal moving-average warm-up).
+ */
+export const LIVE_WINDOW_MS = 3000;
+
+/**
+ * Minimum decode window for reporting the final average speed. A rate is a
+ * ratio over an integration window; below this the window is dominated by
+ * delivery jitter (or is a single burst flush) and the ratio is meaningless.
+ * Same measurement-validity principle as MIN_LIVE_ELAPSED_MS.
+ */
+export const MIN_DECODE_MS = 500;
 
 /** Ignore request anchors that predate the message start by more than this (stale anchor from an aborted request). */
 const MAX_ANCHOR_SKEW_MS = 60_000;
@@ -43,6 +70,8 @@ export class StreamMetrics {
 	private lastDeltaMs: number | null = null;
 	private chars: CharCounts = { cjk: 0, nonCjk: 0 };
 	private hasDelta = false;
+	/** Cumulative char counts at each delta, pruned to the live window; feeds the sliding-window rate. */
+	private charLog: Array<{ t: number; cjk: number; nonCjk: number }> = [];
 	private lastStats: LastMessageStats | undefined;
 
 	/** Drop all state, including the restored last-message stats. */
@@ -53,6 +82,7 @@ export class StreamMetrics {
 		this.lastDeltaMs = null;
 		this.chars = { cjk: 0, nonCjk: 0 };
 		this.hasDelta = false;
+		this.charLog = [];
 		this.lastStats = undefined;
 	}
 
@@ -77,6 +107,7 @@ export class StreamMetrics {
 		this.lastDeltaMs = null;
 		this.chars = { cjk: 0, nonCjk: 0 };
 		this.hasDelta = false;
+		this.charLog = [];
 	}
 
 	/** Account one streamed delta of any kind (text / thinking / toolcall). */
@@ -89,23 +120,43 @@ export class StreamMetrics {
 		const counts = countChars(text);
 		this.chars.cjk += counts.cjk;
 		this.chars.nonCjk += counts.nonCjk;
+		this.charLog.push({ t: now, cjk: this.chars.cjk, nonCjk: this.chars.nonCjk });
+		// Keep at most one entry at or before the window start; it serves as the baseline.
+		while (this.charLog.length >= 2 && (this.charLog[1]?.t ?? Infinity) <= now - LIVE_WINDOW_MS) {
+			this.charLog.shift();
+		}
 	}
 
 	/**
-	 * Current live throughput estimate, or undefined before the stream is long
-	 * enough to be meaningful. `authoritativeTokens` (partial usage.output from
-	 * the provider, when available) always wins over the character estimate.
+	 * Current live throughput: tokens streamed over the last LIVE_WINDOW_MS of
+	 * wall time divided by that fixed span. Because the estimator is linear in
+	 * char counts, the window content is computed exactly from char deltas.
+	 * `authoritativeTokens` (partial usage.output from the provider, when
+	 * available) only floors the reported cumulative estimate.
 	 */
 	liveSample(now: number, calibration?: Calibration, authoritativeTokens = 0): LiveSample | undefined {
-		if (this.firstDeltaMs === null) return undefined;
+		if (this.firstDeltaMs === null || this.charLog.length === 0) return undefined;
 		const elapsedMs = now - this.firstDeltaMs;
 		if (elapsedMs < MIN_LIVE_ELAPSED_MS) return undefined;
-		const estimatedTokens = Math.max(estimateTokens(this.chars, calibration), authoritativeTokens);
-		if (!(estimatedTokens > 0)) return undefined;
+		const last = this.charLog[this.charLog.length - 1];
+		if (!last) return undefined;
+		const cutoff = now - LIVE_WINDOW_MS;
+		let baseCjk = 0;
+		let baseNonCjk = 0;
+		for (let i = this.charLog.length - 1; i >= 0; i--) {
+			const entry = this.charLog[i];
+			if (entry && entry.t <= cutoff) {
+				baseCjk = entry.cjk;
+				baseNonCjk = entry.nonCjk;
+				break;
+			}
+		}
+		const windowTokens = estimateTokens({ cjk: last.cjk - baseCjk, nonCjk: last.nonCjk - baseNonCjk }, calibration);
+		if (!(windowTokens > 0)) return undefined;
 		return {
-			estimatedTokens,
+			estimatedTokens: Math.max(estimateTokens(this.chars, calibration), authoritativeTokens),
 			elapsedMs,
-			tps: estimatedTokens / (elapsedMs / 1000),
+			tps: windowTokens / (LIVE_WINDOW_MS / 1000),
 		};
 	}
 
@@ -114,7 +165,7 @@ export class StreamMetrics {
 	 * nothing to report (no deltas, no authoritative tokens, no chars).
 	 */
 	onMessageEnd(
-		usage: { output: number } | undefined,
+		usage: { output: number; reasoning?: number } | undefined,
 		provider: string,
 		model: string,
 		now: number,
@@ -125,13 +176,20 @@ export class StreamMetrics {
 		const totalChars = countTotalChars(this.chars);
 		if (!this.hasDelta && !hasAuthoritative && totalChars === 0) return undefined;
 
-		const ttftMs = this.firstDeltaMs !== null ? Math.max(0, this.firstDeltaMs - this.resolveRequestStart()) : null;
+		const anchor = this.resolveRequestStart();
+		const ttftMs = this.firstDeltaMs !== null && anchor !== null ? Math.max(0, this.firstDeltaMs - anchor) : null;
 		const decodeMs =
 			this.firstDeltaMs !== null && this.lastDeltaMs !== null
 				? Math.max(0, this.lastDeltaMs - this.firstDeltaMs)
 				: null;
+		const reasoningTokens = hasAuthoritative ? Math.max(0, usage?.reasoning ?? 0) : 0;
 		const outputTokens = hasAuthoritative ? output : Math.round(estimateTokens(this.chars, calibration));
-		const avgTps = decodeMs !== null && decodeMs > 0 && outputTokens > 0 ? outputTokens / (decodeMs / 1000) : null;
+		// Tokens generated but never streamed (hidden reasoning) do not belong in
+		// a decode-speed numerator: they make short visible tails look absurdly
+		// fast. The decode window below MIN_DECODE_MS cannot support a rate.
+		const visibleTokens = Math.max(0, outputTokens - reasoningTokens);
+		const avgTps =
+			decodeMs !== null && decodeMs >= MIN_DECODE_MS && visibleTokens > 0 ? visibleTokens / (decodeMs / 1000) : null;
 
 		const stats: LastMessageStats = {
 			provider,
@@ -140,6 +198,7 @@ export class StreamMetrics {
 			decodeMs,
 			avgTps,
 			outputTokens,
+			reasoningTokens,
 			estimated: !hasAuthoritative,
 			chars: { ...this.chars },
 			endedAt: now,
@@ -148,14 +207,15 @@ export class StreamMetrics {
 		return stats;
 	}
 
-	private resolveRequestStart(): number {
-		if (this.requestStartMs === null) {
-			return this.messageStartMs ?? 0;
+	/** Request anchor for spans: requestStart, or messageStart when missing/stale. Null when neither exists. */
+	private resolveRequestStart(): number | null {
+		if (this.requestStartMs !== null) {
+			if (this.messageStartMs !== null && this.requestStartMs < this.messageStartMs - MAX_ANCHOR_SKEW_MS) {
+				return this.messageStartMs;
+			}
+			return this.requestStartMs;
 		}
-		if (this.messageStartMs !== null && this.requestStartMs < this.messageStartMs - MAX_ANCHOR_SKEW_MS) {
-			return this.messageStartMs;
-		}
-		return this.requestStartMs;
+		return this.messageStartMs;
 	}
 }
 
@@ -171,15 +231,24 @@ export function parseLastStats(data: unknown): LastMessageStats | undefined {
 	if (typeof d.estimated !== "boolean") return undefined;
 	const chars = d.chars as Record<string, unknown> | undefined;
 	if (!chars || !num(chars.cjk) || !num(chars.nonCjk)) return undefined;
-	return {
+	const reasoningTokens = num(d.reasoningTokens) ? d.reasoningTokens : 0;
+	const stats: LastMessageStats = {
 		provider: d.provider,
 		model: d.model,
 		ttftMs: d.ttftMs,
 		decodeMs: d.decodeMs,
 		avgTps: d.avgTps,
 		outputTokens: d.outputTokens,
+		reasoningTokens,
 		estimated: d.estimated,
 		chars: { cjk: chars.cjk, nonCjk: chars.nonCjk },
 		endedAt: d.endedAt,
 	};
+	// Entries persisted before hidden-reasoning handling divided the full
+	// output (including unstreamed reasoning) by a possibly degenerate decode
+	// window. Window validity is all we can re-check locally; repair those.
+	if (stats.decodeMs !== null && stats.decodeMs < MIN_DECODE_MS) {
+		stats.avgTps = null;
+	}
+	return stats;
 }

@@ -9,11 +9,18 @@ Currently: **token speed** in the status bar, managed through a unified `/my-pi`
 
 Shows LLM token throughput in the footer status line:
 
-- **While streaming**: `~45.3 TPS` (accent color) — live estimate, refreshed at most once per second.
-  Streaming token counts are estimated from characters (providers only report authoritative token
-  usage at the end of a message); `~` marks the value as an estimate.
+- **While waiting for the first token**: `⇢1.3s` (accent color) — a live elapsed counter, ticking
+  every 0.1s, so long server-side thinking is visible instead of a silent bar.
+- **While streaming**: `~45.3 TPS` (accent color) — sliding-window rate over the last 3s (fixed
+  denominator, like a download manager's "recent speed"; a burst flush can never produce an absurd
+  figure), refreshed at most once per second. Streaming token counts are estimated from characters
+  (providers only report authoritative token usage at the end of a message); `~` marks the value as
+  an estimate.
 - **When idle**: `⇢1.2s/45.3TPS` (dim color) for the last assistant message — time to first token
-  and average decode speed from authoritative `usage.output` tokens.
+  and average decode speed. The speed numerator is the **visible** output (`usage.output −
+  usage.reasoning`): tokens generated but never streamed (hidden reasoning) don't count. The
+  average is suppressed when the decode window is too short to measure a rate (< 500ms, e.g.
+  whole-message burst delivery) — a rate needs a minimum integration window.
 
 Estimation splits text into CJK and non-CJK characters. Default ratios were calibrated against
 ~22.5k real assistant messages (~15.6M output tokens) with `scripts/analyze-token-ratio.mjs`:

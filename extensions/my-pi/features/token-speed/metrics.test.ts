@@ -1,106 +1,174 @@
 import { describe, expect, it } from "vitest";
+import type { Calibration } from "./estimator.ts";
 import { parseLastStats, StreamMetrics } from "./metrics.ts";
 
-const CALIBRATION = { cjkCharsPerToken: 1.0, nonCjkCharsPerToken: 4.0 };
+const CALIBRATION = { cjkCharsPerToken: 1.0, nonCjkCharsPerToken: 4.0 } as const satisfies Calibration;
+const T0 = 1_000_000;
 
-function feedCompleteMessage(metrics: StreamMetrics, options?: { withRequestAnchor?: boolean; deltaMs?: number[] }) {
+function feedCompleteMessage(
+	metrics: StreamMetrics,
+	options?: {
+		withRequestAnchor?: boolean;
+		deltaMs?: number[];
+		usage?: { output: number; reasoning?: number };
+	},
+) {
 	const withAnchor = options?.withRequestAnchor ?? true;
 	const deltas = options?.deltaMs ?? [1000, 2000, 3000, 4000];
-	if (withAnchor) metrics.onRequestStart(500);
-	metrics.onMessageStart(900);
+	if (withAnchor) metrics.onRequestStart(T0 + 500);
+	metrics.onMessageStart(T0 + 900);
 	for (const at of deltas) {
-		metrics.onDelta("hello ", at);
+		metrics.onDelta("hello ", T0 + at);
 	}
-	return metrics.onMessageEnd({ output: 20 }, "prov", "model", 5000, CALIBRATION);
+	return metrics.onMessageEnd(options?.usage ?? { output: 20 }, "prov", "model", T0 + 5000, CALIBRATION);
 }
 
 describe("StreamMetrics", () => {
-	it("computes ttft, decode duration and average TPS", () => {
+	it("computes ttft, decode window and visible-token average speed", () => {
 		const metrics = new StreamMetrics();
-		const stats = feedCompleteMessage(metrics);
+		const stats = feedCompleteMessage(metrics, { usage: { output: 20, reasoning: 4 } });
 		expect(stats).toBeDefined();
-		expect(stats?.ttftMs).toBe(1000 - 500); // first delta − request start
-		expect(stats?.decodeMs).toBe(4000 - 1000); // last delta − first delta
-		expect(stats?.avgTps).toBeCloseTo(20 / 3, 5);
+		expect(stats?.ttftMs).toBe(500); // first delta − request start
+		expect(stats?.decodeMs).toBe(3000); // last delta − first delta
 		expect(stats?.outputTokens).toBe(20);
+		expect(stats?.reasoningTokens).toBe(4);
+		expect(stats?.avgTps).toBeCloseTo(16 / 3, 5); // (output − hidden reasoning) / decode window
 		expect(stats?.estimated).toBe(false);
 		expect(stats?.chars).toEqual({ cjk: 0, nonCjk: 24 }); // 4 deltas × "hello "
 		expect(metrics.stats).toBe(stats);
 	});
 
+	it("counts all output when the provider reports no hidden reasoning", () => {
+		const metrics = new StreamMetrics();
+		const stats = feedCompleteMessage(metrics, { usage: { output: 20 } });
+		expect(stats?.reasoningTokens).toBe(0);
+		expect(stats?.avgTps).toBeCloseTo(20 / 3, 5);
+	});
+
 	it("falls back to message start when there is no request anchor", () => {
 		const metrics = new StreamMetrics();
-		metrics.onMessageStart(1000);
-		metrics.onDelta("hi", 1500);
-		const stats = metrics.onMessageEnd({ output: 4 }, "prov", "model", 1600);
+		metrics.onMessageStart(T0 + 1000);
+		metrics.onDelta("hi", T0 + 1500);
+		const stats = metrics.onMessageEnd({ output: 4 }, "prov", "model", T0 + 1600);
 		expect(stats?.ttftMs).toBe(500); // 1500 − 1000
 	});
 
 	it("falls back to message start when the anchor is stale", () => {
 		const metrics = new StreamMetrics();
-		metrics.onRequestStart(0); // more than 60s before message start
-		metrics.onMessageStart(120_000);
-		metrics.onDelta("hi", 120_500);
-		const stats = metrics.onMessageEnd({ output: 4 }, "prov", "model", 120_600);
+		metrics.onRequestStart(T0); // more than 60s before message start
+		metrics.onMessageStart(T0 + 120_000);
+		metrics.onDelta("hi", T0 + 120_500);
+		const stats = metrics.onMessageEnd({ output: 4 }, "prov", "model", T0 + 120_600);
 		expect(stats?.ttftMs).toBe(500);
 	});
 
 	it("uses authoritative usage over estimates at message end", () => {
 		const metrics = new StreamMetrics();
-		metrics.onMessageStart(0);
-		metrics.onDelta("你好世界", 100); // 4 CJK chars → 4 tokens at 1.0 chars/token
-		const stats = metrics.onMessageEnd({ output: 99 }, "prov", "model", 200, CALIBRATION);
+		metrics.onMessageStart(T0);
+		metrics.onDelta("你好世界", T0 + 100); // 4 CJK chars → 4 tokens at 1.0 chars/token
+		const stats = metrics.onMessageEnd({ output: 99, reasoning: 3 }, "prov", "model", T0 + 200, CALIBRATION);
 		expect(stats?.outputTokens).toBe(99);
+		expect(stats?.reasoningTokens).toBe(3);
 		expect(stats?.estimated).toBe(false);
 	});
 
 	it("estimates tokens when usage is missing", () => {
 		const metrics = new StreamMetrics();
-		metrics.onMessageStart(0);
-		metrics.onDelta("hello", 100);
-		const stats = metrics.onMessageEnd(undefined, "prov", "model", 200, CALIBRATION);
+		metrics.onMessageStart(T0);
+		metrics.onDelta("hello", T0 + 100);
+		const stats = metrics.onMessageEnd(undefined, "prov", "model", T0 + 200, CALIBRATION);
 		expect(stats?.outputTokens).toBe(1); // 5/4 rounded
+		expect(stats?.reasoningTokens).toBe(0);
 		expect(stats?.estimated).toBe(true);
 	});
 
 	it("returns undefined for messages without any content", () => {
 		const metrics = new StreamMetrics();
-		metrics.onMessageStart(0);
-		expect(metrics.onMessageEnd({ output: 0 }, "prov", "model", 100)).toBeUndefined();
-		expect(metrics.onMessageEnd(undefined, "prov", "model", 100)).toBeUndefined();
+		metrics.onMessageStart(T0);
+		expect(metrics.onMessageEnd({ output: 0 }, "prov", "model", T0 + 100)).toBeUndefined();
+		expect(metrics.onMessageEnd(undefined, "prov", "model", T0 + 100)).toBeUndefined();
 	});
 
-	it("reports null avgTps when decode duration is zero", () => {
+	it("reports no average when the burst flushes the whole message at once", () => {
+		// Real-world pathology: provider generates server-side for ~19.5s, then
+		// delivers everything within 39ms. The decode window cannot support a rate.
 		const metrics = new StreamMetrics();
-		metrics.onMessageStart(0);
-		metrics.onDelta("only", 100);
-		const stats = metrics.onMessageEnd({ output: 5 }, "prov", "model", 150);
-		expect(stats?.decodeMs).toBe(0);
-		expect(stats?.avgTps).toBeNull();
+		metrics.onRequestStart(T0);
+		metrics.onMessageStart(T0 + 100);
+		metrics.onDelta("x".repeat(1872), T0 + 19475);
+		metrics.onDelta(".", T0 + 19514); // last tail chunk
+		const stats = metrics.onMessageEnd({ output: 503 }, "prov", "model", T0 + 19530);
+		expect(stats?.ttftMs).toBe(19475);
+		expect(stats?.decodeMs).toBe(39);
+		expect(stats?.avgTps).toBeNull(); // not 12897
+	});
+
+	it("averages over a healthy decode window", () => {
+		const metrics = new StreamMetrics();
+		metrics.onRequestStart(T0);
+		metrics.onMessageStart(T0);
+		for (let i = 1; i <= 5; i++) {
+			metrics.onDelta("hello ", T0 + i * 500);
+		}
+		const stats = metrics.onMessageEnd({ output: 24 }, "prov", "model", T0 + 3100);
+		expect(stats?.decodeMs).toBe(2000);
+		expect(stats?.avgTps).toBe(12); // 24 tokens / 2s
 	});
 
 	it("liveSample needs a minimum elapsed time and nonzero estimate", () => {
 		const metrics = new StreamMetrics();
-		metrics.onMessageStart(0);
-		expect(metrics.liveSample(1000)).toBeUndefined(); // no delta yet
+		metrics.onMessageStart(T0);
+		expect(metrics.liveSample(T0 + 1000)).toBeUndefined(); // no delta yet
 
-		metrics.onDelta("x", 500);
-		expect(metrics.liveSample(600)).toBeUndefined(); // < 250ms since first delta
+		metrics.onDelta("x", T0 + 500);
+		expect(metrics.liveSample(T0 + 600)).toBeUndefined(); // < 250ms since first delta
 
-		metrics.onDelta("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 600); // 33 chars → ~8 tokens
-		const sample = metrics.liveSample(1500, CALIBRATION);
+		metrics.onDelta("x".repeat(32), T0 + 600); // 33 chars total → ~8 tokens
+		const sample = metrics.liveSample(T0 + 1500, CALIBRATION);
 		expect(sample?.elapsedMs).toBe(1000);
 		expect(sample?.estimatedTokens).toBeCloseTo(33 / 4, 5);
-		expect(sample?.tps).toBeCloseTo(8.25, 5);
+		// 33 chars in the (not yet full) 3s window → 8.25 tokens / 3s.
+		expect(sample?.tps).toBeCloseTo(8.25 / 3, 5);
 	});
 
-	it("liveSample prefers authoritative partial usage over the estimate", () => {
+	it("liveSample is exact once the sliding window is full", () => {
 		const metrics = new StreamMetrics();
-		metrics.onMessageStart(0);
-		metrics.onDelta("x", 0);
-		const sample = metrics.liveSample(1000, CALIBRATION, 42);
+		metrics.onMessageStart(T0);
+		for (let i = 0; i <= 10; i++) {
+			metrics.onDelta("hello ", T0 + i * 500); // 12 chars/s = 3 tokens/s
+		}
+		const sample = metrics.liveSample(T0 + 5000, CALIBRATION);
+		// Window covers the last 3s exactly: 6 deltas × 6 chars = 36 chars = 9 tokens.
+		expect(sample?.tps).toBe(3);
+	});
+
+	it("liveSample bounds a burst flush to burstTokens / window", () => {
+		const metrics = new StreamMetrics();
+		metrics.onRequestStart(T0);
+		metrics.onMessageStart(T0);
+		metrics.onDelta("x".repeat(1872), T0 + 19475); // whole message at once after 19.5s
+		const sample = metrics.liveSample(T0 + 19775, CALIBRATION);
+		expect(sample?.tps).toBe(156); // 468 tokens / 3s — not 1872/0.3s = 6240
+	});
+
+	it("liveSample recovers exactly after the window slides past a burst", () => {
+		const metrics = new StreamMetrics();
+		metrics.onMessageStart(T0);
+		metrics.onDelta("x".repeat(1872), T0 + 19475);
+		for (let i = 0; i <= 6; i++) {
+			metrics.onDelta("hello ", T0 + 20000 + i * 500); // steady 3 tokens/s
+		}
+		const sample = metrics.liveSample(T0 + 23000, CALIBRATION);
+		expect(sample?.tps).toBe(3);
+	});
+
+	it("liveSample uses authoritative partial usage only for the cumulative estimate", () => {
+		const metrics = new StreamMetrics();
+		metrics.onMessageStart(T0);
+		metrics.onDelta("x", T0 + 10);
+		const sample = metrics.liveSample(T0 + 1000, CALIBRATION, 42);
 		expect(sample?.estimatedTokens).toBe(42);
-		expect(sample?.tps).toBe(42);
+		expect(sample?.tps).toBeCloseTo(0.25 / 3, 5); // 1 char → 0.25 tokens over 3s
 	});
 
 	it("reset clears everything including restored stats", () => {
@@ -108,7 +176,7 @@ describe("StreamMetrics", () => {
 		feedCompleteMessage(metrics);
 		metrics.reset();
 		expect(metrics.stats).toBeUndefined();
-		expect(metrics.liveSample(Date.now())).toBeUndefined();
+		expect(metrics.liveSample(T0 + 9999)).toBeUndefined();
 	});
 });
 
@@ -118,6 +186,41 @@ describe("parseLastStats", () => {
 		const stats = feedCompleteMessage(metrics);
 		const parsed = parseLastStats(JSON.parse(JSON.stringify(stats)));
 		expect(parsed).toEqual(stats);
+	});
+
+	it("repairs legacy entries with degenerate decode windows", () => {
+		// Persisted by the old algorithm: full output (incl. hidden reasoning)
+		// divided by a 39ms burst window.
+		const parsed = parseLastStats({
+			provider: "openai",
+			model: "gpt-6.1-sol",
+			ttftMs: 19475,
+			decodeMs: 39,
+			avgTps: 12897.4,
+			outputTokens: 503,
+			estimated: false,
+			chars: { cjk: 0, nonCjk: 1872 },
+			endedAt: 1,
+		});
+		expect(parsed?.avgTps).toBeNull();
+		expect(parsed?.reasoningTokens).toBe(0); // absent in legacy entries
+	});
+
+	it("keeps healthy legacy values", () => {
+		const parsed = parseLastStats({
+			provider: "p",
+			model: "m",
+			ttftMs: 500,
+			decodeMs: 3000,
+			avgTps: 6.7,
+			outputTokens: 20,
+			reasoningTokens: 2,
+			estimated: false,
+			chars: { cjk: 0, nonCjk: 80 },
+			endedAt: 1,
+		});
+		expect(parsed?.avgTps).toBe(6.7);
+		expect(parsed?.reasoningTokens).toBe(2);
 	});
 
 	it("rejects malformed payloads", () => {
@@ -156,9 +259,9 @@ describe("parseLastStats", () => {
 
 	it("round-trips null fields", () => {
 		const metrics = new StreamMetrics();
-		metrics.onMessageStart(0);
-		metrics.onDelta("x", 100);
-		const stats = metrics.onMessageEnd({ output: 3 }, "prov", "model", 150);
+		metrics.onMessageStart(T0);
+		metrics.onDelta("x", T0 + 100);
+		const stats = metrics.onMessageEnd({ output: 3 }, "prov", "model", T0 + 150);
 		const parsed = parseLastStats(JSON.parse(JSON.stringify(stats)));
 		expect(parsed?.decodeMs).toBe(0);
 		expect(parsed?.ttftMs).toBe(100);

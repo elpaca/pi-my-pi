@@ -10,6 +10,11 @@ export function formatStreamingTps(tps: number): string {
 	return `~${formatTps(tps)} TPS`;
 }
 
+/** Live time-to-first-token readout while waiting for the first delta, e.g. "⇢1.3s". */
+export function formatWaitElapsed(elapsedMs: number): string {
+	return `⇢${(elapsedMs / 1000).toFixed(1)}s`;
+}
+
 /**
  * Idle status text for the last completed message, e.g. "⇢1.2s/45.3TPS".
  * Returns undefined when there is nothing worth showing.

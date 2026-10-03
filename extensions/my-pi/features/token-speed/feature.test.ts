@@ -97,7 +97,7 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(400) },
 		});
 		const live = h.statuses.get("my-pi");
-		expect(live).toMatch(/^~\d+ TPS$/);
+		expect(live).toMatch(/^~\d+(\.\d+)? TPS$/);
 
 		// A second render within 1s must not overwrite (throttled).
 		vi.setSystemTime(START + 900);
@@ -212,6 +212,65 @@ describe("token-speed feature wiring", () => {
 
 		h.emit("message_end", { message: assistantMessage({ usage: { output: 50 } }) });
 		expect(h.statuses.get("my-pi")).toMatch(/^⇢/);
+	});
+
+	it("shows a live elapsed counter while waiting for the first token", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request");
+
+		vi.advanceTimersByTime(300);
+		expect(h.statuses.get("my-pi")).toBe("⇢0.3s");
+		vi.advanceTimersByTime(700);
+		expect(h.statuses.get("my-pi")).toBe("⇢1.0s");
+
+		// The first delta stops the counter; the live TPS display takes over
+		// and no further ticks happen (timer is gone).
+		h.emit("message_start", { message: assistantMessage() });
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(10) },
+		});
+		vi.advanceTimersByTime(500);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(400) },
+		});
+		const live = h.statuses.get("my-pi");
+		expect(live).toMatch(/^~\d+(\.\d+)? TPS$/);
+		vi.advanceTimersByTime(2000);
+		expect(h.statuses.get("my-pi")).toBe(live);
+	});
+
+	it("stops the wait counter and clears stale text when the message ends without deltas", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request");
+		vi.advanceTimersByTime(500);
+		expect(h.statuses.get("my-pi")).toBe("⇢0.5s");
+
+		h.emit("message_start", { message: assistantMessage() });
+		h.emit("message_end", { message: assistantMessage({ usage: { output: 10 } }) });
+		expect(h.statuses.get("my-pi")).toBeUndefined();
+		vi.advanceTimersByTime(500); // timer gone: no updates, no crash
+		expect(h.statuses.get("my-pi")).toBeUndefined();
+	});
+
+	it("does not show the wait counter when showDuringStream is off", () => {
+		const h = registerFeature();
+		h.settings.set("tokenSpeed.showDuringStream", false);
+		h.emit("before_provider_request");
+		vi.advanceTimersByTime(1000);
+		expect(h.statuses.get("my-pi")).toBeUndefined();
+	});
+
+	it("stops the wait counter on session shutdown", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request");
+		vi.advanceTimersByTime(200);
+		expect(h.statuses.get("my-pi")).toBe("⇢0.2s");
+		h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+		expect(h.statuses.get("my-pi")).toBeUndefined();
+		vi.advanceTimersByTime(500);
+		expect(h.statuses.get("my-pi")).toBeUndefined();
 	});
 
 	it("clears the status on session shutdown", () => {

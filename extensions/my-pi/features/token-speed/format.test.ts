@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatIdleStats, formatStreamingTps } from "./format.ts";
+import { formatIdleStats, formatStreamingTps, formatWaitElapsed } from "./format.ts";
 import type { LastMessageStats } from "./metrics.ts";
 
 function stats(overrides: Partial<LastMessageStats> = {}): LastMessageStats {
@@ -10,12 +10,21 @@ function stats(overrides: Partial<LastMessageStats> = {}): LastMessageStats {
 		decodeMs: 3000,
 		avgTps: 45.26,
 		outputTokens: 136,
+		reasoningTokens: 0,
 		estimated: false,
 		chars: { cjk: 0, nonCjk: 500 },
 		endedAt: 0,
 		...overrides,
 	};
 }
+
+describe("formatWaitElapsed", () => {
+	it("formats the live ttft counter", () => {
+		expect(formatWaitElapsed(0)).toBe("⇢0.0s");
+		expect(formatWaitElapsed(1234)).toBe("⇢1.2s");
+		expect(formatWaitElapsed(12_345)).toBe("⇢12.3s");
+	});
+});
 
 describe("formatStreamingTps", () => {
 	it("formats with a tilde and one decimal", () => {
