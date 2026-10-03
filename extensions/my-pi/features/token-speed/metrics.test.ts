@@ -126,9 +126,22 @@ describe("StreamMetrics", () => {
 		metrics.onDelta("x".repeat(32), T0 + 600); // 33 chars total → ~8 tokens
 		const sample = metrics.liveSample(T0 + 1500, CALIBRATION);
 		expect(sample?.elapsedMs).toBe(1000);
+		expect(sample?.ttftMs).toBe(500); // first delta − message start anchor
 		expect(sample?.estimatedTokens).toBeCloseTo(33 / 4, 5);
-		// 33 chars in the (not yet full) 3s window → 8.25 tokens / 3s.
-		expect(sample?.tps).toBeCloseTo(8.25 / 3, 5);
+		// Actual-span denominator while the window is not full: 8.25 tokens over
+		// 1.0s of data → the true average immediately, no warm-up ramp.
+		expect(sample?.tps).toBeCloseTo(8.25, 5);
+	});
+
+	it("liveSample is exact during warm-up: steady rate from the first sample", () => {
+		const metrics = new StreamMetrics();
+		metrics.onMessageStart(T0);
+		for (let i = 0; i < 3; i++) {
+			metrics.onDelta("hello ", T0 + i * 500); // 12 chars/s = 3 tokens/s
+		}
+		const sample = metrics.liveSample(T0 + 1500, CALIBRATION);
+		// Window holds all 1.5s of data → 4.5 tokens / 1.5s = 3 TPS (not 4.5/3 = 1.5).
+		expect(sample?.tps).toBe(3);
 	});
 
 	it("liveSample is exact once the sliding window is full", () => {
@@ -142,13 +155,14 @@ describe("StreamMetrics", () => {
 		expect(sample?.tps).toBe(3);
 	});
 
-	it("liveSample bounds a burst flush to burstTokens / window", () => {
+	it("liveSample reports the actual-span average for an early burst", () => {
 		const metrics = new StreamMetrics();
 		metrics.onRequestStart(T0);
 		metrics.onMessageStart(T0);
-		metrics.onDelta("x".repeat(1872), T0 + 19475); // whole message at once after 19.5s
+		metrics.onDelta("x".repeat(1872), T0 + 19475); // everything at once after 19.5s
 		const sample = metrics.liveSample(T0 + 19775, CALIBRATION);
-		expect(sample?.tps).toBe(156); // 468 tokens / 3s — not 1872/0.3s = 6240
+		expect(sample?.ttftMs).toBe(19475);
+		expect(sample?.tps).toBe(1560); // 468 tokens over the observed 0.3s span
 	});
 
 	it("liveSample recovers exactly after the window slides past a burst", () => {
@@ -162,13 +176,45 @@ describe("StreamMetrics", () => {
 		expect(sample?.tps).toBe(3);
 	});
 
+	it("liveSample starts a fresh measurement segment after a delivery gap of one window", () => {
+		const metrics = new StreamMetrics();
+		metrics.onMessageStart(T0);
+		metrics.onDelta("x".repeat(380), T0 + 1000); // 100 tokens, then a 9s stall
+		metrics.onDelta("xx", T0 + 10000); // trickle resumes
+		const sample = metrics.liveSample(T0 + 10250, CALIBRATION);
+		// Segment restarted at the first post-gap delta: 0.5 tokens over 0.25s.
+		// Without the reset the 3s denominator would span the stall → ~0.17 TPS.
+		expect(sample?.elapsedMs).toBe(250);
+		expect(sample?.tps).toBe(2);
+	});
+
+	it("liveSample keeps the window across gaps smaller than one window span", () => {
+		const metrics = new StreamMetrics();
+		metrics.onMessageStart(T0);
+		metrics.onDelta("x".repeat(380), T0 + 1000); // 100 tokens
+		metrics.onDelta("xx", T0 + 3000); // 2s gap (< 3s window): no segment reset
+		const sample = metrics.liveSample(T0 + 3250, CALIBRATION);
+		expect(sample?.elapsedMs).toBe(2250);
+		expect(sample?.tps).toBeCloseTo(95.5 / 2.25, 5); // 380 chars + "xx" over the 2.25s span
+	});
+
+	it("onDelta ignores empty deltas", () => {
+		const metrics = new StreamMetrics();
+		metrics.onMessageStart(T0);
+		metrics.onDelta("", T0 + 100);
+		expect(metrics.liveSample(T0 + 2000, CALIBRATION)).toBeUndefined(); // nothing anchored
+		metrics.onDelta("x".repeat(8), T0 + 300);
+		const sample = metrics.liveSample(T0 + 560, CALIBRATION);
+		expect(sample?.ttftMs).toBe(300); // anchored at the first non-empty delta
+	});
+
 	it("liveSample uses authoritative partial usage only for the cumulative estimate", () => {
 		const metrics = new StreamMetrics();
 		metrics.onMessageStart(T0);
-		metrics.onDelta("x", T0 + 10);
-		const sample = metrics.liveSample(T0 + 1000, CALIBRATION, 42);
+		metrics.onDelta("x", T0 + 100);
+		const sample = metrics.liveSample(T0 + 1100, CALIBRATION, 42);
 		expect(sample?.estimatedTokens).toBe(42);
-		expect(sample?.tps).toBeCloseTo(0.25 / 3, 5); // 1 char → 0.25 tokens over 3s
+		expect(sample?.tps).toBeCloseTo(0.25, 5); // 1 char → 0.25 tokens over the observed 1.0s
 	});
 
 	it("reset clears everything including restored stats", () => {

@@ -3,7 +3,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Feature } from "../../types.ts";
 import { CalibrationCache, calibrationKey } from "./calibration.ts";
 import { type Calibration, countTotalChars } from "./estimator.ts";
-import { formatIdleStats, formatStreamingTps, formatWaitElapsed } from "./format.ts";
+import { formatIdleStats, formatStreamingStats, formatWaitElapsed } from "./format.ts";
 import { parseLastStats, StreamMetrics } from "./metrics.ts";
 
 const STATUS_KEY = "my-pi";
@@ -106,7 +106,7 @@ export const tokenSpeedFeature: Feature = {
 			if (!sample) return;
 			if (now - lastLiveUpdateMs < LIVE_UPDATE_INTERVAL_MS) return;
 			lastLiveUpdateMs = now;
-			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", formatStreamingTps(sample.tps)));
+			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", formatStreamingStats(sample)));
 		};
 
 		pi.on("before_provider_request", (_event, ctx) => {
@@ -129,7 +129,7 @@ export const tokenSpeedFeature: Feature = {
 			const streamEvent = event.assistantMessageEvent;
 			const delta = extractDelta(streamEvent);
 			const now = Date.now();
-			if (delta !== undefined) {
+			if (delta) {
 				if (waitTimer !== undefined) {
 					stopWaitTimer();
 					lastLiveUpdateMs = 0; // render the first live sample immediately

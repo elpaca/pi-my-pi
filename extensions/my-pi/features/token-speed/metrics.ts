@@ -29,6 +29,8 @@ export interface LastMessageStats {
 /** A point-in-time sample of the currently streaming message. */
 export interface LiveSample {
 	estimatedTokens: number;
+	/** Time to first delta, ms; null when no request/message anchor exists. */
+	ttftMs: number | null;
 	/** Elapsed time since the first delta, ms. */
 	elapsedMs: number;
 	tps: number;
@@ -38,13 +40,14 @@ export interface LiveSample {
 export const MIN_LIVE_ELAPSED_MS = 250;
 
 /**
- * Span of the sliding window behind the live rate, with a fixed denominator —
- * the standard "recent speed" readout of progress UIs and bandwidth monitors.
- * A burst of N tokens arriving at once can lift the rate by at most
- * N / LIVE_WINDOW_MS, so burst delivery (hidden reasoning followed by a
- * instant flush, buffering relays) stays bounded instead of producing a
- * tokens-per-39ms absurdity. The window is exact for steady streams and ramps
- * up during the first span (normal moving-average warm-up).
+ * Span of the sliding window behind the live rate. The denominator is the
+ * actual span of window data: min(elapsed, LIVE_WINDOW_MS) — the usual
+ * "recent speed" readout of progress UIs and bandwidth monitors. A steady
+ * stream therefore shows its true rate immediately (no warm-up ramp), and
+ * once the window is full a burst ages out over exactly LIVE_WINDOW_MS; a
+ * burst of N tokens arriving at once can lift the rate by at most
+ * N / (its own span), bounded by N / MIN_LIVE_ELAPSED_MS, and the figure
+ * decays as the window slides past it.
  */
 export const LIVE_WINDOW_MS = 3000;
 
@@ -70,6 +73,14 @@ export class StreamMetrics {
 	private lastDeltaMs: number | null = null;
 	private chars: CharCounts = { cjk: 0, nonCjk: 0 };
 	private hasDelta = false;
+	/**
+	 * Start of the current live measurement segment: the first delta, or the
+	 * first delta after a delivery gap of at least LIVE_WINDOW_MS (a stall —
+	 * e.g. hidden server-side reasoning — invalidates the running window).
+	 */
+	private liveAnchorMs: number | null = null;
+	/** Cumulative char counts at liveAnchorMs; window fallback when no entry precedes the cutoff. */
+	private segmentBase: CharCounts = { cjk: 0, nonCjk: 0 };
 	/** Cumulative char counts at each delta, pruned to the live window; feeds the sliding-window rate. */
 	private charLog: Array<{ t: number; cjk: number; nonCjk: number }> = [];
 	private lastStats: LastMessageStats | undefined;
@@ -82,6 +93,8 @@ export class StreamMetrics {
 		this.lastDeltaMs = null;
 		this.chars = { cjk: 0, nonCjk: 0 };
 		this.hasDelta = false;
+		this.liveAnchorMs = null;
+		this.segmentBase = { cjk: 0, nonCjk: 0 };
 		this.charLog = [];
 		this.lastStats = undefined;
 	}
@@ -107,14 +120,26 @@ export class StreamMetrics {
 		this.lastDeltaMs = null;
 		this.chars = { cjk: 0, nonCjk: 0 };
 		this.hasDelta = false;
+		this.liveAnchorMs = null;
+		this.segmentBase = { cjk: 0, nonCjk: 0 };
 		this.charLog = [];
 	}
 
 	/** Account one streamed delta of any kind (text / thinking / toolcall). */
 	onDelta(text: string, now: number): void {
+		if (text.length === 0) return; // degenerate event: no content, no timing
 		if (!this.hasDelta) {
 			this.firstDeltaMs = now;
 			this.hasDelta = true;
+			this.liveAnchorMs = now;
+			this.segmentBase = { cjk: 0, nonCjk: 0 };
+		} else if (this.lastDeltaMs !== null && now - this.lastDeltaMs >= LIVE_WINDOW_MS) {
+			// Delivery gap of at least one full window (hidden reasoning stall,
+			// buffering relay): the running window cannot describe the resumed
+			// stream, so start a fresh measurement segment here.
+			this.liveAnchorMs = now;
+			this.segmentBase = { ...this.chars };
+			this.charLog = [{ t: now, cjk: this.chars.cjk, nonCjk: this.chars.nonCjk }];
 		}
 		this.lastDeltaMs = now;
 		const counts = countChars(text);
@@ -129,20 +154,25 @@ export class StreamMetrics {
 
 	/**
 	 * Current live throughput: tokens streamed over the last LIVE_WINDOW_MS of
-	 * wall time divided by that fixed span. Because the estimator is linear in
-	 * char counts, the window content is computed exactly from char deltas.
-	 * `authoritativeTokens` (partial usage.output from the provider, when
-	 * available) only floors the reported cumulative estimate.
+	 * wall time, divided by the actual span of that window data (min(elapsed,
+	 * LIVE_WINDOW_MS)) so early samples show their true average instead of a
+	 * warm-up ramp. Because the estimator is linear in char counts, the window
+	 * content is computed exactly from char deltas. `authoritativeTokens`
+	 * (partial usage.output from the provider, when available) only floors the
+	 * reported cumulative estimate.
 	 */
 	liveSample(now: number, calibration?: Calibration, authoritativeTokens = 0): LiveSample | undefined {
-		if (this.firstDeltaMs === null || this.charLog.length === 0) return undefined;
-		const elapsedMs = now - this.firstDeltaMs;
+		if (this.firstDeltaMs === null || this.liveAnchorMs === null || this.charLog.length === 0) return undefined;
+		const elapsedMs = now - this.liveAnchorMs;
 		if (elapsedMs < MIN_LIVE_ELAPSED_MS) return undefined;
 		const last = this.charLog[this.charLog.length - 1];
 		if (!last) return undefined;
 		const cutoff = now - LIVE_WINDOW_MS;
-		let baseCjk = 0;
-		let baseNonCjk = 0;
+		// Window baseline: last cumulative entry at or before the cutoff; when the
+		// window reaches back to the segment start (warm-up or fresh segment), the
+		// cumulative counts at the segment anchor.
+		let baseCjk = this.segmentBase.cjk;
+		let baseNonCjk = this.segmentBase.nonCjk;
 		for (let i = this.charLog.length - 1; i >= 0; i--) {
 			const entry = this.charLog[i];
 			if (entry && entry.t <= cutoff) {
@@ -153,10 +183,13 @@ export class StreamMetrics {
 		}
 		const windowTokens = estimateTokens({ cjk: last.cjk - baseCjk, nonCjk: last.nonCjk - baseNonCjk }, calibration);
 		if (!(windowTokens > 0)) return undefined;
+		const anchor = this.resolveRequestStart();
+		const windowMs = Math.min(elapsedMs, LIVE_WINDOW_MS);
 		return {
 			estimatedTokens: Math.max(estimateTokens(this.chars, calibration), authoritativeTokens),
+			ttftMs: anchor !== null ? Math.max(0, this.firstDeltaMs - anchor) : null,
 			elapsedMs,
-			tps: windowTokens / (LIVE_WINDOW_MS / 1000),
+			tps: windowTokens / (windowMs / 1000),
 		};
 	}
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { formatIdleStats, formatStreamingTps, formatWaitElapsed } from "./format.ts";
-import type { LastMessageStats } from "./metrics.ts";
+import { formatIdleStats, formatStreamingStats, formatStreamingTps, formatWaitElapsed } from "./format.ts";
+import type { LastMessageStats, LiveSample } from "./metrics.ts";
 
 function stats(overrides: Partial<LastMessageStats> = {}): LastMessageStats {
 	return {
@@ -17,6 +17,25 @@ function stats(overrides: Partial<LastMessageStats> = {}): LastMessageStats {
 		...overrides,
 	};
 }
+
+describe("formatStreamingStats", () => {
+	const sample = (overrides: Partial<LiveSample>): LiveSample => ({
+		estimatedTokens: 0,
+		ttftMs: null,
+		elapsedMs: 0,
+		tps: 0,
+		...overrides,
+	});
+
+	it("carries the ttft prefix over from the wait phase", () => {
+		expect(formatStreamingStats(sample({ ttftMs: 1300, tps: 45.26 }))).toBe("⇢1.3s ~45.3 TPS");
+		expect(formatStreamingStats(sample({ ttftMs: 0, tps: 1560.4 }))).toBe("⇢0.0s ~1560 TPS");
+	});
+
+	it("shows N/A when the ttft anchor is unknown", () => {
+		expect(formatStreamingStats(sample({ ttftMs: null, tps: 45.26 }))).toBe("⇢N/A ~45.3 TPS");
+	});
+});
 
 describe("formatWaitElapsed", () => {
 	it("formats the live ttft counter", () => {
@@ -41,23 +60,23 @@ describe("formatStreamingTps", () => {
 });
 
 describe("formatIdleStats", () => {
-	it("formats ttft and tps", () => {
-		expect(formatIdleStats(stats())).toBe("⇢1.2s/45.3TPS");
+	it("formats ttft and tps separated by a space", () => {
+		expect(formatIdleStats(stats())).toBe("⇢1.2s 45.3TPS");
 	});
 
-	it("formats ttft only", () => {
-		expect(formatIdleStats(stats({ avgTps: null }))).toBe("⇢1.2s");
+	it("shows N/A for an unmeasurable speed (e.g. burst flush)", () => {
+		expect(formatIdleStats(stats({ avgTps: null }))).toBe("⇢1.2s N/A");
 	});
 
-	it("formats tps only", () => {
-		expect(formatIdleStats(stats({ ttftMs: null }))).toBe("⇢45.3TPS");
+	it("shows N/A for an unknown ttft", () => {
+		expect(formatIdleStats(stats({ ttftMs: null }))).toBe("⇢N/A 45.3TPS");
 	});
 
 	it("rounds tps to whole numbers at 100 and above", () => {
-		expect(formatIdleStats(stats({ ttftMs: null, avgTps: 234.5 }))).toBe("⇢235TPS");
+		expect(formatIdleStats(stats({ ttftMs: null, avgTps: 234.5 }))).toBe("⇢N/A 235TPS");
 	});
 
-	it("returns undefined when there is nothing to show", () => {
-		expect(formatIdleStats(stats({ ttftMs: null, avgTps: null }))).toBeUndefined();
+	it("shows plain N/A when nothing about the message is measurable", () => {
+		expect(formatIdleStats(stats({ ttftMs: null, avgTps: null }))).toBe("N/A");
 	});
 });

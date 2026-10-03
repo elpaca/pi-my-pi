@@ -97,7 +97,7 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(400) },
 		});
 		const live = h.statuses.get("my-pi");
-		expect(live).toMatch(/^~\d+(\.\d+)? TPS$/);
+		expect(live).toMatch(/^⇢\d+(\.\d+)?s ~\d+(\.\d+)? TPS$/);
 
 		// A second render within 1s must not overwrite (throttled).
 		vi.setSystemTime(START + 900);
@@ -121,7 +121,7 @@ describe("token-speed feature wiring", () => {
 			message: assistantMessage({ usage: { output: 300 } }),
 		});
 		const idle = h.statuses.get("my-pi");
-		expect(idle).toMatch(/^⇢\d+(\.\d+)s\/\d+(\.\d+)?TPS$/);
+		expect(idle).toMatch(/^⇢\d+(\.\d+)s \d+(\.\d+)?TPS$/);
 
 		// Turn ends: stats persisted exactly once.
 		h.emit("turn_end");
@@ -171,7 +171,7 @@ describe("token-speed feature wiring", () => {
 			[{ type: "custom", customType: "my-pi.token-speed", data: stats }] as never[];
 
 		h.emit("session_start", { type: "session_start", reason: "resume" });
-		expect(h.statuses.get("my-pi")).toBe("⇢0.8s/33.3TPS");
+		expect(h.statuses.get("my-pi")).toBe("⇢0.8s 33.3TPS");
 
 		// No duplicate persistence for restored stats.
 		h.emit("turn_end");
@@ -236,12 +236,12 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(400) },
 		});
 		const live = h.statuses.get("my-pi");
-		expect(live).toMatch(/^~\d+(\.\d+)? TPS$/);
+		expect(live).toMatch(/^⇢\d+(\.\d+)?s ~\d+(\.\d+)? TPS$/);
 		vi.advanceTimersByTime(2000);
 		expect(h.statuses.get("my-pi")).toBe(live);
 	});
 
-	it("stops the wait counter and clears stale text when the message ends without deltas", () => {
+	it("stops the wait counter and shows N/A when the message ends without deltas", () => {
 		const h = registerFeature();
 		h.emit("before_provider_request");
 		vi.advanceTimersByTime(500);
@@ -249,9 +249,10 @@ describe("token-speed feature wiring", () => {
 
 		h.emit("message_start", { message: assistantMessage() });
 		h.emit("message_end", { message: assistantMessage({ usage: { output: 10 } }) });
-		expect(h.statuses.get("my-pi")).toBeUndefined();
+		// Nothing was streamable (no deltas → no ttft, no measurable speed).
+		expect(h.statuses.get("my-pi")).toBe("N/A");
 		vi.advanceTimersByTime(500); // timer gone: no updates, no crash
-		expect(h.statuses.get("my-pi")).toBeUndefined();
+		expect(h.statuses.get("my-pi")).toBe("N/A");
 	});
 
 	it("does not show the wait counter when showDuringStream is off", () => {

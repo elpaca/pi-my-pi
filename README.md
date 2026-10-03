@@ -10,17 +10,24 @@ Currently: **token speed** in the status bar, managed through a unified `/my-pi`
 Shows LLM token throughput in the footer status line:
 
 - **While waiting for the first token**: `⇢1.3s` (accent color) — a live elapsed counter, ticking
-  every 0.1s, so long server-side thinking is visible instead of a silent bar.
-- **While streaming**: `~45.3 TPS` (accent color) — sliding-window rate over the last 3s (fixed
-  denominator, like a download manager's "recent speed"; a burst flush can never produce an absurd
-  figure), refreshed at most once per second. Streaming token counts are estimated from characters
-  (providers only report authoritative token usage at the end of a message); `~` marks the value as
-  an estimate.
-- **When idle**: `⇢1.2s/45.3TPS` (dim color) for the last assistant message — time to first token
+  every 0.1s, so long server-side thinking is visible instead of a silent bar. Once the first token
+  arrives the same prefix carries over into the streaming display.
+- **While streaming**: `⇢1.3s ~45.3 TPS` (accent color) — time to first token plus a sliding-window
+  rate over the last 3s, refreshed at most once per second. While the stream is younger than the
+  window the rate is averaged over its actual span (a steady stream shows its true speed from the
+  first sample, no warm-up ramp); once the window is full a burst ages out over exactly 3s. A
+  delivery silence of one full window or more (hidden server-side reasoning, buffering relays)
+  starts a fresh measurement segment, so the rate right after a stall describes the resumed stream,
+  not the stall. Streaming token counts are estimated from characters (providers only report
+  authoritative token usage at the end of a message); `~` marks the value as an estimate.
+- **When idle**: `⇢1.2s 45.3TPS` (dim color) for the last assistant message — time to first token
   and average decode speed. The speed numerator is the **visible** output (`usage.output −
   usage.reasoning`): tokens generated but never streamed (hidden reasoning) don't count. The
   average is suppressed when the decode window is too short to measure a rate (< 500ms, e.g.
   whole-message burst delivery) — a rate needs a minimum integration window.
+- **Unmeasurable slots show `N/A`** instead of a misleading number: unknown TTFT (no request
+  anchor), speed below the measurement limits (burst flush, no visible tokens), or `N/A` alone
+  when nothing about a message could be measured.
 
 Estimation splits text into CJK and non-CJK characters. Default ratios were calibrated against
 ~22.5k real assistant messages (~15.6M output tokens) with `scripts/analyze-token-ratio.mjs`:
@@ -42,9 +49,15 @@ and session tree navigation (branch switches restore the stats of the current br
 ## Install
 
 ```sh
-pi install github:elpaca/pi-my-pi
+pi install git:github.com/elpaca/pi-my-pi
 # or, for local development:
 pi -e /path/to/pi-my-pi
+```
+
+## Update
+
+```sh
+pi update --extensions
 ```
 
 ## Usage
