@@ -23,22 +23,22 @@ describe("formatWaitSegments", () => {
 	it("shows the context estimate static and the counter live", () => {
 		expect(formatWaitSegments(1234, 115_000)).toEqual([
 			{ text: "I115.0k", live: false },
-			{ text: "⇢1.2s", live: true },
+			{ text: "F1.2s", live: true },
 		]);
 	});
 
 	it("omits the context when it is unknown", () => {
-		expect(formatWaitSegments(300, null)).toEqual([{ text: "⇢0.3s", live: true }]);
+		expect(formatWaitSegments(300, null)).toEqual([{ text: "F0.3s", live: true }]);
 	});
 
 	it("appends the previous message's average as a frozen speed reference", () => {
 		expect(formatWaitSegments(1234, 115_000, 45.26)).toEqual([
 			{ text: "I115.0k", live: false },
-			{ text: "⇢1.2s", live: true },
+			{ text: "F1.2s", live: true },
 			{ text: "~45.3 TPS", live: false },
 		]);
 		// No measurable previous message: no reference.
-		expect(formatWaitSegments(300, null, null)).toEqual([{ text: "⇢0.3s", live: true }]);
+		expect(formatWaitSegments(300, null, null)).toEqual([{ text: "F0.3s", live: true }]);
 	});
 });
 
@@ -54,10 +54,10 @@ describe("formatStreamingSegments", () => {
 		...overrides,
 	});
 
-	it("renders I ⇢ T O ~TPS in temporal order with live flags on the updating parts", () => {
+	it("renders I F T O ~TPS in temporal order with live flags on the updating parts", () => {
 		expect(formatStreamingSegments(sample({}))).toEqual([
 			{ text: "I115.0k", live: false },
-			{ text: "⇢1.3s", live: false },
+			{ text: "F1.3s", live: false },
 			{ text: "T4.5k", live: true },
 			{ text: "O3.7k", live: true },
 			{ text: "~45.3 TPS", live: true },
@@ -66,15 +66,15 @@ describe("formatStreamingSegments", () => {
 
 	it("carries the ttft prefix over from the wait phase and marks N/A without an anchor", () => {
 		expect(formatStreamingSegments(sample({ ttftMs: 0, tps: 1560.4 }))).toContainEqual({
-			text: "⇢0.0s",
+			text: "F0.0s",
 			live: false,
 		});
-		expect(formatStreamingSegments(sample({ ttftMs: null }))).toContainEqual({ text: "⇢N/A", live: false });
+		expect(formatStreamingSegments(sample({ ttftMs: null }))).toContainEqual({ text: "FN/A", live: false });
 	});
 
 	it("omits unstreamed thinking, unknown context and a too-young rate", () => {
 		expect(formatStreamingSegments(sample({ estimatedThinkingTokens: null, inputTokens: null, tps: null }))).toEqual([
-			{ text: "⇢1.3s", live: false },
+			{ text: "F1.3s", live: false },
 			{ text: "O3.7k", live: true },
 		]);
 	});
@@ -83,7 +83,7 @@ describe("formatStreamingSegments", () => {
 		// Thinking phase: no O0 placeholder.
 		expect(formatStreamingSegments(sample({ estimatedOutputTokens: 0 }))).toEqual([
 			{ text: "I115.0k", live: false },
-			{ text: "⇢1.3s", live: false },
+			{ text: "F1.3s", live: false },
 			{ text: "T4.5k", live: true },
 			{ text: "~45.3 TPS", live: true },
 		]);
@@ -92,14 +92,14 @@ describe("formatStreamingSegments", () => {
 			formatStreamingSegments(
 				sample({ estimatedOutputTokens: 0.4, estimatedThinkingTokens: null, inputTokens: null, tps: null }),
 			),
-		).toEqual([{ text: "⇢1.3s", live: false }]);
+		).toEqual([{ text: "F1.3s", live: false }]);
 		// As soon as it rounds to one token, the slot appears.
 		expect(
 			formatStreamingSegments(
 				sample({ estimatedOutputTokens: 0.6, estimatedThinkingTokens: null, inputTokens: null, tps: null }),
 			),
 		).toEqual([
-			{ text: "⇢1.3s", live: false },
+			{ text: "F1.3s", live: false },
 			{ text: "O1", live: true },
 		]);
 	});
@@ -136,10 +136,10 @@ describe("formatIdleSegments", () => {
 		...overrides,
 	});
 
-	it("renders I ⇢ T O TPS in temporal order, all static", () => {
+	it("renders I F T O TPS in temporal order, all static", () => {
 		expect(formatIdleSegments(stats())).toEqual([
 			{ text: "I115.0k", live: false },
-			{ text: "⇢1.2s", live: false },
+			{ text: "F1.2s", live: false },
 			{ text: "T4.5k", live: false },
 			{ text: "O3.7k", live: false },
 			{ text: "45.3TPS", live: false },
@@ -169,12 +169,12 @@ describe("formatIdleSegments", () => {
 		// Burst flush: speed unmeasurable.
 		expect(formatIdleSegments(stats({ avgTps: null }))).toContainEqual({ text: "N/A", live: false });
 		// No anchor: ttft slot N/A.
-		expect(formatIdleSegments(stats({ ttftMs: null }))).toContainEqual({ text: "⇢N/A", live: false });
+		expect(formatIdleSegments(stats({ ttftMs: null }))).toContainEqual({ text: "FN/A", live: false });
 		// Nothing streamable and no thinking: I/T slots gone.
 		expect(
 			formatIdleSegments(stats({ reasoningTokens: 0, inputTokens: undefined, inputEstimated: undefined })),
 		).toEqual([
-			{ text: "⇢1.2s", live: false },
+			{ text: "F1.2s", live: false },
 			{ text: "O8.2k", live: false },
 			{ text: "45.3TPS", live: false },
 		]);

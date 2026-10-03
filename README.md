@@ -9,13 +9,14 @@ Currently: **token speed** in the status bar, managed through a unified `/my-pi`
 
 Shows token counters and LLM throughput in the footer status line:
 
-- **While waiting for the first token**: `I115.0k ⇢1.3s` — the estimated total input size
+- **While waiting for the first token**: `I115.0k F1.3s` — the estimated total input size
   (system + tools + messages, estimated once per request from the outgoing payload; static for
   the request, dim) plus a live elapsed counter (accent), ticking every 0.1s, so long
   server-side thinking is visible instead of a silent bar. Once the first token arrives the same
-  counter carries over into the streaming display as the TTFT slot.
+  counter carries over into the streaming display as the TTFT slot (the `F` slot, for first
+  token).
 - **While streaming** the segments follow the temporal order of a request:
-  `I115.0k ⇢1.3s T4.5k O3.7k ~45.3 TPS` — input goes out, the first token arrives (TTFT),
+  `I115.0k F1.3s T4.5k O3.7k ~45.3 TPS` — input goes out, the first token arrives (`F` = TTFT),
   thinking streams (`T`), then the visible output (`O`), and the rate describes the whole
   generation. The `O` and `T` counters refresh on **every** delta; the rate figure updates at
   most once per second. Parts that update in real time render in the accent color, frozen parts
@@ -30,7 +31,7 @@ Shows token counters and LLM throughput in the footer status line:
   slot appears once that output is measurable (no `O0` placeholder during the thinking phase);
   the `T` slot appears only while thinking content is actually streamed — hidden reasoning
   stays invisible until the reliable end-of-message count.
-- **When idle**: `I115.0k ⇢1.2s T4.5k O3.7k 45.3TPS` (all dim) for the last assistant message,
+- **When idle**: `I115.0k F1.2s T4.5k O3.7k 45.3TPS` (all dim) for the last assistant message,
   same order. Reliable provider data wins over estimates: input from
   `usage.input + usage.cacheRead + usage.cacheWrite` (pi-ai reports the uncached input
   separately from cache; the sum is the total prompt, matching the payload estimate; otherwise

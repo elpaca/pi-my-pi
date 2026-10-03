@@ -39,7 +39,7 @@ export function formatStreamingTps(tps: number): string {
 
 /**
  * Wait-phase segments: the estimated total input size (static for the
- * whole request) plus the live elapsed counter, e.g. `I115.0k ⇢1.3s`.
+ * whole request) plus the live elapsed counter, e.g. `I115.0k F1.3s`.
  * The previous message's average decode speed is appended as a frozen
  * reference (`~… TPS`, dim) — the only speed figure available before the
  * first token arrives; omitted when there is none (first request, or the
@@ -53,7 +53,7 @@ export function formatWaitSegments(
 	const segments: StatusSegment[] = [];
 	const cache = inputSegment(inputTokens);
 	if (cache) segments.push(cache);
-	segments.push({ text: `⇢${formatSeconds(elapsedMs)}`, live: true });
+	segments.push({ text: `F${formatSeconds(elapsedMs)}`, live: true });
 	if (previousTps !== null && previousTps !== undefined) {
 		segments.push({ text: formatStreamingTps(previousTps), live: false });
 	}
@@ -61,7 +61,7 @@ export function formatWaitSegments(
 }
 
 /**
- * Streaming segments in temporal order: `I… ⇢… T… O… ~… TPS` — input goes
+ * Streaming segments in temporal order: `I… F… T… O… ~… TPS` — input goes
  * out, the first token arrives (ttft), thinking streams, then the visible
  * output, and the rate describes the whole generation. O (non-thinking
  * output) and T update on every delta while streaming; T appears only while
@@ -75,7 +75,7 @@ export function formatStreamingSegments(sample: LiveSample): StatusSegment[] {
 	const segments: StatusSegment[] = [];
 	const input = inputSegment(sample.inputTokens);
 	if (input) segments.push(input);
-	segments.push({ text: sample.ttftMs !== null ? `⇢${formatSeconds(sample.ttftMs)}` : "⇢N/A", live: false });
+	segments.push({ text: sample.ttftMs !== null ? `F${formatSeconds(sample.ttftMs)}` : "FN/A", live: false });
 	if (sample.estimatedThinkingTokens !== null) {
 		segments.push({ text: `T${formatTokenCount(sample.estimatedThinkingTokens)}`, live: true });
 	}
@@ -89,7 +89,7 @@ export function formatStreamingSegments(sample: LiveSample): StatusSegment[] {
 }
 
 /**
- * Idle segments for the last completed message, e.g. `I115.0k ⇢1.2s T4.5k
+ * Idle segments for the last completed message, e.g. `I115.0k F1.2s T4.5k
  * O8.2k 45.3TPS`, in the same temporal order as the streaming display;
  * everything is final, so nothing highlights. Reliable data wins over
  * estimates (provider reasoning over streamed-thinking estimate); O shows
@@ -101,10 +101,10 @@ export function formatIdleSegments(stats: LastMessageStats): StatusSegment[] {
 	const segments: StatusSegment[] = [];
 	const input = inputSegment(stats.inputTokens);
 	if (input) segments.push(input);
-	const ttft = stats.ttftMs !== null ? `⇢${formatSeconds(stats.ttftMs)}` : null;
+	const ttft = stats.ttftMs !== null ? `F${formatSeconds(stats.ttftMs)}` : null;
 	const tps = stats.avgTps !== null ? `${formatTps(stats.avgTps)}TPS` : null;
 	if (ttft !== null || tps !== null) {
-		segments.push({ text: ttft ?? "⇢N/A", live: false });
+		segments.push({ text: ttft ?? "FN/A", live: false });
 	}
 	const thinking = stats.reasoningTokens > 0 ? stats.reasoningTokens : (stats.thinkingEstimatedTokens ?? 0);
 	if (thinking > 0) {
