@@ -26,9 +26,10 @@ Shows token counters and LLM throughput in the footer status line:
   rate right after a stall describes the resumed stream, not the stall. Streaming counts are
   estimated from characters (providers only report authoritative token usage at the end of a
   message); the `~` marks the rate as an estimate. `O` counts **non-thinking** output only
-  (text + tool calls) — thinking belongs to `T`, so `T + O` tracks the total output. The `T`
-  slot appears only while thinking content is actually streamed — hidden reasoning stays
-  invisible until the reliable end-of-message count.
+  (text + tool calls) — thinking belongs to `T`, so `T + O` tracks the total output. The `O`
+  slot appears once that output is measurable (no `O0` placeholder during the thinking phase);
+  the `T` slot appears only while thinking content is actually streamed — hidden reasoning
+  stays invisible until the reliable end-of-message count.
 - **When idle**: `I115.0k ⇢1.2s T4.5k O3.7k 45.3TPS` (all dim) for the last assistant message,
   same order. Reliable provider data wins over estimates: input from
   `usage.input + usage.cacheRead + usage.cacheWrite` (pi-ai reports the uncached input

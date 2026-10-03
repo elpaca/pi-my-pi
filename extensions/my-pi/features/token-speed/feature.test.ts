@@ -335,7 +335,7 @@ describe("token-speed feature wiring", () => {
 			message: assistantMessage(),
 			assistantMessageEvent: { type: "thinking_delta", delta: "x".repeat(38) },
 		});
-		expect(h.statuses.get("my-pi")).toBe("⇢0.1s T10 O0");
+		expect(h.statuses.get("my-pi")).toBe("⇢0.1s T10");
 
 		vi.setSystemTime(START + 300);
 		h.emit("message_update", {

@@ -55,9 +55,10 @@ export function formatWaitSegments(elapsedMs: number, inputTokens: number | null
  * output, and the rate describes the whole generation. O (non-thinking
  * output) and T update on every delta while streaming; T appears only while
  * thinking content is actually streamed (hidden reasoning stays invisible
- * until the reliable end-of-message count); the ttft slot is frozen after
- * the first token; the window rate is throttled upstream. Unmeasurable
- * slots show N/A or are omitted.
+ * until the reliable end-of-message count); O appears once non-thinking
+ * output is measurable (≥ 1 token equivalent) — the thinking phase shows no
+ * O0 placeholder. The ttft slot is frozen after the first token; the window
+ * rate is throttled upstream. Unmeasurable slots show N/A or are omitted.
  */
 export function formatStreamingSegments(sample: LiveSample): StatusSegment[] {
 	const segments: StatusSegment[] = [];
@@ -67,7 +68,9 @@ export function formatStreamingSegments(sample: LiveSample): StatusSegment[] {
 	if (sample.estimatedThinkingTokens !== null) {
 		segments.push({ text: `T${formatTokenCount(sample.estimatedThinkingTokens)}`, live: true });
 	}
-	segments.push({ text: `O${formatTokenCount(sample.estimatedOutputTokens)}`, live: true });
+	if (Math.round(sample.estimatedOutputTokens) >= 1) {
+		segments.push({ text: `O${formatTokenCount(sample.estimatedOutputTokens)}`, live: true });
+	}
 	if (sample.tps !== null) {
 		segments.push({ text: formatStreamingTps(sample.tps), live: true });
 	}

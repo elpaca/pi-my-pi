@@ -68,6 +68,31 @@ describe("formatStreamingSegments", () => {
 			{ text: "O3.7k", live: true },
 		]);
 	});
+
+	it("omits O until the non-thinking output is measurable", () => {
+		// Thinking phase: no O0 placeholder.
+		expect(formatStreamingSegments(sample({ estimatedOutputTokens: 0 }))).toEqual([
+			{ text: "I115.0k", live: false },
+			{ text: "⇢1.3s", live: false },
+			{ text: "T4.5k", live: true },
+			{ text: "~45.3 TPS", live: true },
+		]);
+		// Sub-token output still rounds to zero: no slot yet.
+		expect(
+			formatStreamingSegments(
+				sample({ estimatedOutputTokens: 0.4, estimatedThinkingTokens: null, inputTokens: null, tps: null }),
+			),
+		).toEqual([{ text: "⇢1.3s", live: false }]);
+		// As soon as it rounds to one token, the slot appears.
+		expect(
+			formatStreamingSegments(
+				sample({ estimatedOutputTokens: 0.6, estimatedThinkingTokens: null, inputTokens: null, tps: null }),
+			),
+		).toEqual([
+			{ text: "⇢1.3s", live: false },
+			{ text: "O1", live: true },
+		]);
+	});
 });
 
 describe("formatStreamingTps", () => {
