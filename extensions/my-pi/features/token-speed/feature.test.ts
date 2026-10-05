@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SettingsStore } from "../../settings.ts";
+import { CalibrationCache, calibrationKey, MIN_SAMPLES } from "./calibration.ts";
 import { tokenSpeedFeature } from "./index.ts";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => void;
@@ -398,6 +399,52 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(10) },
 		});
 		expect(h.statuses.get("my-pi")).toBe("F0.2s T300 O3 ~303 TPS");
+	});
+
+	it("estimates the input size with the learned input calibration", () => {
+		// Seed a learned input calibration (4.7 nonCjk chars/token) for the model.
+		const writer = new CalibrationCache({ dir: cacheDir });
+		const key = calibrationKey("prov", "model-x");
+		for (let i = 0; i < MIN_SAMPLES + 5; i++) {
+			const cjk = 2 + (i % 10);
+			const nonCjk = 100 + ((i * 71) % 900);
+			writer.recordInput(key, cjk, nonCjk, cjk / 1.3 + nonCjk / 4.7);
+		}
+
+		const h = registerFeature();
+		(h.ctx as { model?: unknown }).model = { provider: "prov", id: "model-x" };
+		h.emit("before_provider_request", {
+			type: "before_provider_request",
+			payload: { model: "model-x", messages: [{ role: "user", content: "x.".repeat(1900) }] },
+		});
+		vi.advanceTimersByTime(100);
+		// 3811 counted chars (payload strings incl. role/model) / 4.7 ≈ 811 —
+		// not the default-ratio 3811/3.8 ≈ 1003.
+		expect(h.statuses.get("my-pi")).toBe("I811 F0.1s");
+	});
+
+	it("records input calibration from the authoritative prompt total", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request", {
+			type: "before_provider_request",
+			payload: { model: "model-x", messages: [{ role: "user", content: "x.".repeat(1900) }] },
+		});
+		h.emit("message_start", { message: assistantMessage() });
+		vi.setSystemTime(START + 100);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(40) },
+		});
+		h.emit("message_end", {
+			message: assistantMessage({ usage: { output: 100, input: 500, cacheRead: 1000 } }),
+		});
+
+		const reader = new CalibrationCache({ dir: cacheDir });
+		reader.load();
+		const stats = reader.inputStats(calibrationKey("prov", "model-x"));
+		expect(stats?.n).toBe(1);
+		expect(stats?.sumNonCjk).toBe(3811); // 3800 payload chars + role/model strings
+		expect(stats?.sumOut).toBe(1500); // input + cacheRead
 	});
 
 	it("shows the previous message's average speed while waiting for the first token", () => {

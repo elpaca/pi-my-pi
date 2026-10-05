@@ -42,10 +42,13 @@ export interface ModelCalibrationStats {
 
 export interface CalibrationFileData {
 	version: number;
+	/** Output-char calibration per model: assistant chars → billed output tokens. */
 	models: Record<string, ModelCalibrationStats>;
+	/** Input-char calibration per model: request payload chars → billed prompt tokens. */
+	inputs: Record<string, ModelCalibrationStats>;
 }
 
-const FILE_VERSION = 1;
+const FILE_VERSION = 2;
 
 export function calibrationKey(provider: string, model: string): string {
 	return `${provider}/${model}`;
@@ -107,37 +110,57 @@ function isFiniteNumber(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
-/** Validate and normalize file contents. Returns undefined for missing/corrupt/incompatible data. */
+function parseModelStats(raw: unknown): ModelCalibrationStats | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const s = raw as Record<string, unknown>;
+	const numericFields = ["s11", "s12", "s22", "s1y", "s2y", "sumCjk", "sumNonCjk", "sumOut"];
+	if (!isFiniteNumber(s.n) || !numericFields.every((field) => isFiniteNumber(s[field]))) return undefined;
+	return {
+		n: s.n,
+		s11: s.s11 as number,
+		s12: s.s12 as number,
+		s22: s.s22 as number,
+		s1y: s.s1y as number,
+		s2y: s.s2y as number,
+		sumCjk: s.sumCjk as number,
+		sumNonCjk: s.sumNonCjk as number,
+		sumOut: s.sumOut as number,
+		updatedAt: typeof s.updatedAt === "string" ? s.updatedAt : new Date(0).toISOString(),
+	};
+}
+
+/**
+ * Validate and normalize file contents. Returns undefined for missing/corrupt
+ * data. Version 1 files carried only the output calibration; their models are
+ * migrated as-is (the accumulated output samples stay valuable) and the input
+ * calibration starts empty.
+ */
 export function parseCalibrationFile(data: unknown): CalibrationFileData | undefined {
 	if (!data || typeof data !== "object") return undefined;
 	const version = (data as { version?: unknown }).version;
-	if (version !== FILE_VERSION) return undefined;
+	if (version !== 1 && version !== FILE_VERSION) return undefined;
 	const models = (data as { models?: unknown }).models;
 	if (!models || typeof models !== "object") return undefined;
-	const result: CalibrationFileData = { version: FILE_VERSION, models: {} };
+	const result: CalibrationFileData = { version: FILE_VERSION, models: {}, inputs: {} };
 	for (const [key, raw] of Object.entries(models as Record<string, unknown>)) {
-		if (!raw || typeof raw !== "object") continue;
-		const s = raw as Record<string, unknown>;
-		const numericFields = ["s11", "s12", "s22", "s1y", "s2y", "sumCjk", "sumNonCjk", "sumOut"];
-		if (!isFiniteNumber(s.n) || !numericFields.every((field) => isFiniteNumber(s[field]))) continue;
-		result.models[key] = {
-			n: s.n,
-			s11: s.s11 as number,
-			s12: s.s12 as number,
-			s22: s.s22 as number,
-			s1y: s.s1y as number,
-			s2y: s.s2y as number,
-			sumCjk: s.sumCjk as number,
-			sumNonCjk: s.sumNonCjk as number,
-			sumOut: s.sumOut as number,
-			updatedAt: typeof s.updatedAt === "string" ? s.updatedAt : new Date(0).toISOString(),
-		};
+		const stats = parseModelStats(raw);
+		if (stats) result.models[key] = stats;
+	}
+	if (version === FILE_VERSION) {
+		const inputs = (data as { inputs?: unknown }).inputs;
+		if (inputs && typeof inputs === "object") {
+			for (const [key, raw] of Object.entries(inputs as Record<string, unknown>)) {
+				const stats = parseModelStats(raw);
+				if (stats) result.inputs[key] = stats;
+			}
+		}
 	}
 	return result;
 }
 
 export class CalibrationCache {
 	private readonly models = new Map<string, ModelCalibrationStats>();
+	private readonly inputs = new Map<string, ModelCalibrationStats>();
 	private readonly file: string;
 
 	constructor(options?: { dir?: string }) {
@@ -158,18 +181,34 @@ export class CalibrationCache {
 		for (const [key, stats] of Object.entries(data.models)) {
 			this.models.set(key, stats);
 		}
+		for (const [key, stats] of Object.entries(data.inputs)) {
+			this.inputs.set(key, stats);
+		}
 	}
 
-	/** Calibrated ratios for a model, or undefined until enough samples exist. */
+	/** Calibrated output ratios for a model, or undefined until enough samples exist. */
 	get(key: string): Calibration | undefined {
 		return solveCalibration(this.models.get(key));
+	}
+
+	/**
+	 * Calibrated input ratios for a model: payload chars → billed prompt
+	 * tokens. The input text mix (tool schemas, tool results, code) tokenizes
+	 * differently from assistant output, so it gets its own regression.
+	 */
+	getInput(key: string): Calibration | undefined {
+		return solveCalibration(this.inputs.get(key));
 	}
 
 	stats(key: string): ModelCalibrationStats | undefined {
 		return this.models.get(key);
 	}
 
-	/** Record one completed message and flush the cache to disk. */
+	inputStats(key: string): ModelCalibrationStats | undefined {
+		return this.inputs.get(key);
+	}
+
+	/** Record one completed message's output stats and flush the cache to disk. */
 	record(key: string, cjkChars: number, nonCjkChars: number, outputTokens: number, now: Date = new Date()): void {
 		if (!(outputTokens > 0) || cjkChars + nonCjkChars <= 0) return;
 		let stats = this.models.get(key);
@@ -181,13 +220,30 @@ export class CalibrationCache {
 		this.flush();
 	}
 
+	/**
+	 * Record one completed request's input stats: the request-time payload
+	 * chars against the authoritative billed prompt total (input + cacheRead +
+	 * cacheWrite), and flush the cache to disk.
+	 */
+	recordInput(key: string, cjkChars: number, nonCjkChars: number, promptTokens: number, now: Date = new Date()): void {
+		if (!(promptTokens > 0) || cjkChars + nonCjkChars <= 0) return;
+		let stats = this.inputs.get(key);
+		if (!stats) {
+			stats = emptyStats();
+			this.inputs.set(key, stats);
+		}
+		addSample(stats, cjkChars, nonCjkChars, promptTokens, now);
+		this.flush();
+	}
+
 	/** Best-effort atomic write; failures are silently ignored (cache semantics). */
 	flush(): void {
-		if (this.models.size === 0) return;
+		if (this.models.size === 0 && this.inputs.size === 0) return;
 		try {
 			const data: CalibrationFileData = {
 				version: FILE_VERSION,
 				models: Object.fromEntries(this.models),
+				inputs: Object.fromEntries(this.inputs),
 			};
 			mkdirSync(dirname(this.file), { recursive: true });
 			const tempFile = `${this.file}.tmp-${process.pid}`;

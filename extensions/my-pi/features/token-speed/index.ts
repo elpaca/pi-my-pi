@@ -4,6 +4,7 @@ import type { Feature } from "../../types.ts";
 import { CalibrationCache, calibrationKey } from "./calibration.ts";
 import {
 	type Calibration,
+	type CharCounts,
 	countPayloadChars,
 	countTotalChars,
 	DEFAULT_CALIBRATION,
@@ -60,6 +61,8 @@ export const tokenSpeedFeature: Feature = {
 		let lastLiveUpdateMs = 0;
 		let lastSample: LiveSample | undefined;
 		let persistedEndedAt = 0;
+		/** Request-time payload chars, paired with the response's authoritative prompt total. */
+		let requestChars: CharCounts | undefined;
 
 		const isEnabled = (): boolean => settings.getBoolean("tokenSpeed.enabled");
 		const showDuringStream = (): boolean => settings.getBoolean("tokenSpeed.showDuringStream");
@@ -149,11 +152,15 @@ export const tokenSpeedFeature: Feature = {
 			const now = Date.now();
 			metrics.onRequestStart(now);
 			// Estimate the total input size (system + tools + messages) from the
-			// outgoing payload once per request, with the same calibration the
-			// live display will use.
+			// outgoing payload once per request. The char→token mapping uses the
+			// INPUT calibration — learned from authoritative prompt totals against
+			// payload chars, because the input text mix (tool schemas, results,
+			// code) tokenizes differently from assistant output.
 			const model = ctx.model;
-			const calibration = model ? cache.get(calibrationKey(model.provider, model.id)) : undefined;
+			const requestKey = model ? calibrationKey(model.provider, model.id) : undefined;
+			const calibration = requestKey ? cache.getInput(requestKey) : undefined;
 			const chars = countPayloadChars(event.payload);
+			requestChars = chars;
 			metrics.setInputEstimate(
 				countTotalChars(chars) > 0 ? Math.round(estimateTokens(chars, calibration ?? DEFAULT_CALIBRATION)) : null,
 			);
@@ -202,6 +209,13 @@ export const tokenSpeedFeature: Feature = {
 			if (!stats.estimated && visibleTokens > 0 && countTotalChars(stats.chars) > 0) {
 				cache.record(key, stats.chars.cjk, stats.chars.nonCjk, visibleTokens, new Date(now));
 			}
+			// The authoritative prompt total (input + cacheRead + cacheWrite)
+			// against the request-time payload chars feeds the input calibration
+			// for future wait/streaming input estimates.
+			if (stats.inputEstimated === false && requestChars && countTotalChars(requestChars) > 0) {
+				cache.recordInput(key, requestChars.cjk, requestChars.nonCjk, stats.inputTokens ?? 0, new Date(now));
+			}
+			requestChars = undefined;
 			renderIdle(ctx);
 		});
 

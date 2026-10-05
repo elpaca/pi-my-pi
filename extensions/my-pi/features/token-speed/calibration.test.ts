@@ -97,7 +97,26 @@ describe("parseCalibrationFile", () => {
 
 		expect(parseCalibrationFile(null)).toBeUndefined();
 		expect(parseCalibrationFile({})).toBeUndefined();
-		expect(parseCalibrationFile({ version: 2, models: {} })).toBeUndefined();
+		expect(parseCalibrationFile({ version: 3, models: {} })).toBeUndefined();
+	});
+
+	it("migrates version 1 files: output stats kept, input calibration empty", () => {
+		const stats = generateSamples(MIN_SAMPLES + 1, 1.2, 4.0);
+		const legacy = parseCalibrationFile({ version: 1, models: { "p/m": stats } });
+		expect(legacy?.version).toBe(2);
+		expect(legacy?.models["p/m"]).toEqual(stats);
+		expect(legacy?.inputs).toEqual({});
+		// Unknown version is still rejected.
+		expect(parseCalibrationFile({ version: 2, models: {} })).toBeDefined();
+		expect(parseCalibrationFile({ version: 1, inputs: {} })).toBeUndefined();
+	});
+
+	it("accepts version 2 files with input calibration", () => {
+		const out = generateSamples(MIN_SAMPLES, 1.2, 4.0);
+		const input = generateSamples(MIN_SAMPLES, 5.0, 5.0);
+		const parsed = parseCalibrationFile({ version: 2, models: { "p/m": out }, inputs: { "p/m": input } });
+		expect(parsed?.models["p/m"]).toEqual(out);
+		expect(parsed?.inputs["p/m"]).toEqual(input);
 	});
 });
 
@@ -121,7 +140,37 @@ describe("CalibrationCache", () => {
 		expect(reader.get(calibrationKey("provider-a", "model-y"))).toBeUndefined();
 
 		const raw = JSON.parse(readFileSync(join(dir, "token-ratio.json"), "utf8")) as { version: number };
-		expect(raw.version).toBe(1);
+		expect(raw.version).toBe(2);
+	});
+
+	it("round-trips input calibration through the cache file", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-my-pi-cache-"));
+		const key = calibrationKey("provider-a", "model-x");
+
+		const writer = new CalibrationCache({ dir });
+		expect(writer.getInput(key)).toBeUndefined();
+		for (let i = 0; i < MIN_SAMPLES + 15; i++) {
+			const cjk = 2 + (i % 10);
+			const nonCjk = 100 + ((i * 71) % 900);
+			writer.recordInput(key, cjk, nonCjk, Math.round(cjk / 1.3 + nonCjk / 4.7));
+		}
+		expect(writer.getInput(key)?.nonCjkCharsPerToken).toBeCloseTo(4.7, 1);
+		// Output calibration is untouched by input samples.
+		expect(writer.get(key)).toBeUndefined();
+
+		const reader = new CalibrationCache({ dir });
+		reader.load();
+		expect(reader.getInput(key)?.nonCjkCharsPerToken).toBeCloseTo(4.7, 1);
+	});
+
+	it("keeps the version 1 output stats when loading a legacy file", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-my-pi-cache-"));
+		const stats = generateSamples(MIN_SAMPLES + 1, 1.25, 3.9);
+		writeFileSync(join(dir, "token-ratio.json"), JSON.stringify({ version: 1, models: { "p/m": stats } }), "utf8");
+		const cache = new CalibrationCache({ dir });
+		cache.load();
+		expect(cache.get("p/m")?.cjkCharsPerToken).toBeCloseTo(1.25, 1);
+		expect(cache.getInput("p/m")).toBeUndefined();
 	});
 
 	it("ignores records with no tokens or no characters", () => {

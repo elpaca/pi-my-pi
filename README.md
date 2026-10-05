@@ -12,7 +12,11 @@ Shows token counters and LLM throughput in the footer status line:
 - **While waiting for the first token**: `I115.0k F1.3s` — the estimated total input size
   (system + tools + messages, estimated once per request from the outgoing payload; static for
   the request, dim) plus a live elapsed counter (accent), ticking every 0.1s, so long
-  server-side thinking is visible instead of a silent bar. Once the first token arrives the same
+  server-side thinking is visible instead of a silent bar. The char→token mapping uses a
+  per-model **input calibration** learned online from past requests (authoritative prompt
+  totals vs payload chars) — input text (tool schemas, tool results, code) tokenizes
+  differently from assistant output, so it gets its own regression instead of reusing the
+  output ratios. Once the first token arrives the same
   counter carries over into the streaming display as the TTFT slot (the `F` slot, for first
   token).
 - **While streaming** the segments follow the temporal order of a request:
