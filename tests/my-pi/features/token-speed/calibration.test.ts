@@ -10,8 +10,8 @@ import {
 	MIN_SAMPLES,
 	parseCalibrationFile,
 	solveCalibration,
-} from "./calibration.ts";
-import type { Calibration, CharCounts } from "./estimator.ts";
+} from "../../../../extensions/my-pi/features/token-speed/calibration.ts";
+import type { Calibration, CharCounts } from "../../../../extensions/my-pi/features/token-speed/estimator.ts";
 
 function mk(cjk: number, word: number, digit: number, punct: number, space: number): CharCounts {
 	return { cjk, word, digit, punct, space };
@@ -35,8 +35,8 @@ function generateSamples(count: number, ratios: Calibration) {
 
 const RATIOS: Calibration = { cjk: 1.2, word: 4.0, digit: 2.5, punct: 2.0, space: 5.0 };
 
-describe("solveCalibration", () => {
-	it("recovers exact ratios from well-conditioned samples", () => {
+describe("calibration", () => {
+	it("solves exact ratios from well-conditioned samples, including signed (shrinking-context) deltas", () => {
 		const solved = solveCalibration(generateSamples(200, RATIOS));
 		expect(solved).toBeDefined();
 		expect(solved?.cjk).toBeCloseTo(1.2, 2);
@@ -44,12 +44,12 @@ describe("solveCalibration", () => {
 		expect(solved?.digit).toBeCloseTo(2.5, 2);
 		expect(solved?.punct).toBeCloseTo(2.0, 2);
 		expect(solved?.space).toBeCloseTo(5.0, 2);
-	});
 
-	it("accepts signed (delta) samples: shrinking contexts keep coefficients positive", () => {
-		const stats = emptyStats();
+		// Δ training samples are signed: every third request shrinks the
+		// context, and the regression must still recover positive ratios.
+		const signed = emptyStats();
 		for (let i = 0; i < MIN_SAMPLES + 10; i++) {
-			const sign = i % 3 === 0 ? -1 : 1; // every third request shrinks the context
+			const sign = i % 3 === 0 ? -1 : 1;
 			const counts = mk(
 				sign * (5 + (i % 30)),
 				sign * (100 + ((i * 37) % 500)),
@@ -58,42 +58,37 @@ describe("solveCalibration", () => {
 				sign * (8 + (i % 15)),
 			);
 			addSample(
-				stats,
+				signed,
 				counts,
 				sign *
 					(counts.cjk / 1.2 + counts.word / 4.0 + counts.digit / 2.5 + counts.punct / 2.0 + counts.space / 5.0) *
 					sign,
 			);
 		}
-		const solved = solveCalibration(stats);
-		expect(solved?.word).toBeCloseTo(4.0, 2);
+		expect(solveCalibration(signed)?.word).toBeCloseTo(4.0, 2);
 	});
 
-	it("returns undefined below the minimum sample count", () => {
+	it("rejects insufficient or degenerate sample data", () => {
 		expect(solveCalibration(generateSamples(MIN_SAMPLES - 1, RATIOS))).toBeUndefined();
 		expect(solveCalibration(emptyStats())).toBeUndefined();
 		expect(solveCalibration(undefined)).toBeUndefined();
-	});
 
-	it("returns undefined for degenerate (collinear or constant) data", () => {
-		// Perfectly collinear buckets: word = 2·cjk, others zero
+		// Perfectly collinear buckets: word = 2·cjk, others zero.
 		const collinear = emptyStats();
 		for (let i = 0; i < 100; i++) {
 			addSample(collinear, mk(10 + i, 2 * (10 + i), 0, 0, 0), 30);
 		}
 		expect(solveCalibration(collinear)).toBeUndefined();
 
-		// Zero variance in every bucket
+		// Zero variance in every bucket.
 		const constant = emptyStats();
 		for (let i = 0; i < 100; i++) {
 			addSample(constant, mk(10, 20, 0, 0, 0), 10);
 		}
 		expect(solveCalibration(constant)).toBeUndefined();
 	});
-});
 
-describe("addSample", () => {
-	it("accumulates the Gram matrix and projections", () => {
+	it("accumulates the Gram matrix and projections per sample", () => {
 		const stats = emptyStats();
 		addSample(stats, mk(2, 10, 0, 4, 0), 20, new Date("2026-01-01T00:00:00Z"));
 		addSample(stats, mk(0, 20, 3, 0, 5), 30, new Date("2026-01-02T00:00:00Z"));
@@ -106,14 +101,13 @@ describe("addSample", () => {
 		expect(stats.sumTokens).toBe(50);
 		expect(stats.updatedAt).toBe("2026-01-02T00:00:00.000Z");
 	});
-});
 
-describe("parseCalibrationFile", () => {
-	it("accepts valid v3 data and skips corrupt entries", () => {
+	it("parses v3 files leniently and rejects incompatible legacy formats", () => {
 		const stats = generateSamples(MIN_SAMPLES + 1, RATIOS);
 		const valid = parseCalibrationFile({ version: 3, models: { "p/m": stats } });
 		expect(valid?.models["p/m"]).toEqual(stats);
 
+		// Corrupt entries are skipped, not fatal.
 		const lenient = parseCalibrationFile({ version: 3, models: { bad: { n: "x" } } });
 		expect(lenient).toBeDefined();
 		expect(Object.keys(lenient?.models ?? {})).toHaveLength(0);
@@ -125,12 +119,11 @@ describe("parseCalibrationFile", () => {
 		expect(parseCalibrationFile({ version: 1, models: {} })).toBeUndefined();
 		expect(parseCalibrationFile({ version: 2, models: {}, inputs: {} })).toBeUndefined();
 	});
-});
 
-describe("CalibrationCache", () => {
-	it("round-trips recorded stats through the cache file", () => {
+	it("records, round-trips and filters samples through the cache file", () => {
 		const dir = mkdtempSync(join(tmpdir(), "pi-my-pi-cache-"));
 		const key = calibrationKey("provider-a", "model-x");
+		expect(key).toBe("provider-a/model-x");
 
 		const writer = new CalibrationCache({ dir });
 		expect(writer.get(key)).toBeUndefined();
@@ -145,28 +138,27 @@ describe("CalibrationCache", () => {
 		expect(writer.get(key)?.word).toBeCloseTo(3.9, 1);
 		expect(writer.get(key)?.cjk).toBeCloseTo(1.25, 1);
 
+		// The cache file survives a reload in a fresh instance.
 		const reader = new CalibrationCache({ dir });
 		reader.load();
 		expect(reader.get(key)?.word).toBeCloseTo(3.9, 1);
 		expect(reader.get(calibrationKey("provider-a", "model-y"))).toBeUndefined();
-
 		const raw = JSON.parse(readFileSync(join(dir, "token-ratio.json"), "utf8")) as { version: number };
 		expect(raw.version).toBe(3);
+
+		// Zero-token or zero-count records are uninformative: dropped.
+		const filtered = new CalibrationCache({ dir: mkdtempSync(join(tmpdir(), "pi-my-pi-cache-")) });
+		const other = calibrationKey("p", "m");
+		filtered.record(other, mk(0, 0, 0, 0, 0), 100);
+		filtered.record(other, mk(10, 20, 0, 0, 0), 0);
+		expect(filtered.stats(other)).toBeUndefined();
+		// Signed deltas (a shrinking context) are kept.
+		filtered.record(other, mk(-50, -200, 0, -30, 0), -80);
+		expect(filtered.stats(other)?.n).toBe(1);
+		expect(filtered.stats(other)?.sumTokens).toBe(-80);
 	});
 
-	it("keeps signed delta samples (shrinking context) and ignores zero-token/zero-count records", () => {
-		const dir = mkdtempSync(join(tmpdir(), "pi-my-pi-cache-"));
-		const cache = new CalibrationCache({ dir });
-		const key = calibrationKey("p", "m");
-		cache.record(key, mk(0, 0, 0, 0, 0), 100);
-		cache.record(key, mk(10, 20, 0, 0, 0), 0);
-		expect(cache.stats(key)).toBeUndefined();
-		cache.record(key, mk(-50, -200, 0, -30, 0), -80);
-		expect(cache.stats(key)?.n).toBe(1);
-		expect(cache.stats(key)?.sumTokens).toBe(-80);
-	});
-
-	it("tolerates a missing or corrupt cache file", () => {
+	it("tolerates missing, corrupt and legacy cache files", () => {
 		const dir = mkdtempSync(join(tmpdir(), "pi-my-pi-cache-"));
 		const missing = new CalibrationCache({ dir });
 		expect(() => missing.load()).not.toThrow();
@@ -176,21 +168,14 @@ describe("CalibrationCache", () => {
 		const corrupt = new CalibrationCache({ dir });
 		expect(() => corrupt.load()).not.toThrow();
 		expect(corrupt.get("p/m")).toBeUndefined();
-	});
 
-	it("rejects a legacy (pre-v3) cache file", () => {
-		const dir = mkdtempSync(join(tmpdir(), "pi-my-pi-cache-"));
 		writeFileSync(
 			join(dir, "token-ratio.json"),
 			JSON.stringify({ version: 2, models: { "p/m": { n: 99 } }, inputs: {} }),
 			"utf8",
 		);
-		const cache = new CalibrationCache({ dir });
-		cache.load();
-		expect(cache.get("p/m")).toBeUndefined();
-	});
-
-	it("calibrationKey joins provider and model", () => {
-		expect(calibrationKey("Volcengine Coding Plan", "glm-5.3")).toBe("Volcengine Coding Plan/glm-5.3");
+		const legacy = new CalibrationCache({ dir });
+		legacy.load();
+		expect(legacy.get("p/m")).toBeUndefined();
 	});
 });

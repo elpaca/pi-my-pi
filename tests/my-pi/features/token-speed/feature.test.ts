@@ -3,9 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { SettingsStore } from "../../settings.ts";
-import { CalibrationCache, calibrationKey, MIN_SAMPLES } from "./calibration.ts";
-import { tokenSpeedFeature } from "./index.ts";
+import {
+	CalibrationCache,
+	calibrationKey,
+	MIN_SAMPLES,
+} from "../../../../extensions/my-pi/features/token-speed/calibration.ts";
+import { tokenSpeedFeature } from "../../../../extensions/my-pi/features/token-speed/index.ts";
+import { SettingsStore } from "../../../../extensions/my-pi/settings.ts";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => void;
 

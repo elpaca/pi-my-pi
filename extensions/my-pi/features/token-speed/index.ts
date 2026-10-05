@@ -1,4 +1,3 @@
-import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Feature } from "../../types.ts";
 import { CalibrationCache, calibrationKey } from "./calibration.ts";
@@ -8,21 +7,6 @@ import { parseLastStats, StreamMetrics } from "./metrics.ts";
 import { CalibrationTrainer } from "./training.ts";
 
 const CUSTOM_TYPE = "my-pi.token-speed";
-
-type DeltaKind = "text" | "thinking" | "toolcall";
-
-function extractDelta(event: AssistantMessageEvent): { text: string; kind: DeltaKind } | undefined {
-	switch (event.type) {
-		case "text_delta":
-			return { text: event.delta, kind: "text" };
-		case "thinking_delta":
-			return { text: event.delta, kind: "thinking" };
-		case "toolcall_delta":
-			return { text: event.delta, kind: "toolcall" };
-		default:
-			return undefined;
-	}
-}
 
 export const tokenSpeedFeature: Feature = {
 	id: "token-speed",
@@ -85,11 +69,11 @@ export const tokenSpeedFeature: Feature = {
 			lastCtx = ctx;
 			const message = event.message;
 			if (message.role !== "assistant") return;
-			const delta = extractDelta(event.assistantMessageEvent);
 			const now = Date.now();
-			if (delta) {
+			const ev = event.assistantMessageEvent;
+			if (ev.type === "text_delta" || ev.type === "thinking_delta" || ev.type === "toolcall_delta") {
 				status.endWait(); // first delta: the live display takes over
-				metrics.onDelta(delta.text, delta.kind, now);
+				metrics.onDelta(ev.delta, ev.type, now);
 			}
 			const key = calibrationKey(message.provider, message.model);
 			status.renderLive(ctx, now, cache.get(key), message.usage?.output ?? 0);

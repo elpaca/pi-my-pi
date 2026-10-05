@@ -239,7 +239,7 @@ export class StreamMetrics {
 	}
 
 	/** Account one streamed delta. Kind separates visible thinking from other output. */
-	onDelta(text: string, kind: "text" | "thinking" | "toolcall", now: number): void {
+	onDelta(text: string, kind: "text_delta" | "thinking_delta" | "toolcall_delta", now: number): void {
 		if (text.length === 0) return; // degenerate event: no content, no timing
 		if (!this.hasDelta) {
 			this.firstDeltaMs = now;
@@ -257,7 +257,7 @@ export class StreamMetrics {
 		this.lastDeltaMs = now;
 		const counts = countTextChars(text);
 		addCounts(this.chars, counts);
-		addCounts(kind === "thinking" ? this.thinkingChars : this.outputChars, counts);
+		addCounts(kind === "thinking_delta" ? this.thinkingChars : this.outputChars, counts);
 		this.charLog.push({ t: now, c: { ...this.chars } });
 		// Keep at most one entry at or before the window start; it serves as the baseline.
 		while (this.charLog.length >= 2 && (this.charLog[1]?.t ?? Infinity) <= now - LIVE_WINDOW_MS) {

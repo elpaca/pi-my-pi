@@ -124,6 +124,7 @@ extensions/my-pi/
     ├── calibration.ts           per-model least-squares calibration cache
     └── format.ts                status text formatting
 scripts/analyze-token-ratio.mjs  offline calibration analysis over session files
+tests/my-pi/                     tests (mirror the extensions/my-pi layout)
 ```
 
 ## License
