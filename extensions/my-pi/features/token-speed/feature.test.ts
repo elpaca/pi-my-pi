@@ -308,7 +308,7 @@ describe("token-speed feature wiring", () => {
 			payload: { model: "model-x", messages: [{ role: "user", content: "x.".repeat(1900) }] },
 		});
 		vi.advanceTimersByTime(100);
-		expect(h.statuses.get("my-pi")).toBe("I1.0k F0.1s");
+		expect(h.statuses.get("my-pi")).toBe("I1.4k F0.1s");
 
 		h.emit("message_start", { message: assistantMessage() });
 		vi.setSystemTime(START + 300);
@@ -317,14 +317,15 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
 		});
 		// First delta: counters live, rate still inside its minimum window.
-		expect(h.statuses.get("my-pi")).toBe("I1.0k F0.3s O100");
+		expect(h.statuses.get("my-pi")).toBe("I1.4k F0.3s O95");
 
 		vi.setSystemTime(START + 600);
 		h.emit("message_update", {
 			message: assistantMessage(),
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
 		});
-		expect(h.statuses.get("my-pi")).toBe("I1.0k F0.3s O200 ~667 TPS");
+		// O: 760 chars / 4 = 190; rate: 190 tokens over the 0.3s of data so far.
+		expect(h.statuses.get("my-pi")).toBe("I1.4k F0.3s O190 ~633 TPS");
 	});
 
 	it("updates thinking and output counts on every delta while the rate stays throttled", () => {
@@ -343,7 +344,7 @@ describe("token-speed feature wiring", () => {
 			message: assistantMessage(),
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
 		});
-		expect(h.statuses.get("my-pi")).toBe("F0.1s T10 O100");
+		expect(h.statuses.get("my-pi")).toBe("F0.1s T10 O95");
 
 		vi.setSystemTime(START + 500);
 		h.emit("message_update", {
@@ -351,7 +352,8 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "thinking_delta", delta: "x".repeat(38) },
 		});
 		// T/O grew on every delta; the rate appeared as soon as it was measurable.
-		expect(h.statuses.get("my-pi")).toBe("F0.1s T20 O100 ~300 TPS");
+		// T: 76/4 = 19, O: 380/4 = 95; rate: 456/4 = 114 tokens over 0.4s.
+		expect(h.statuses.get("my-pi")).toBe("F0.1s T19 O95 ~285 TPS");
 	});
 
 	it("shows reliable cache, thinking and output counts when the message ends", () => {
@@ -401,14 +403,22 @@ describe("token-speed feature wiring", () => {
 		expect(h.statuses.get("my-pi")).toBe("F0.2s T300 O3 ~303 TPS");
 	});
 
-	it("estimates the input size with the learned input calibration", () => {
-		// Seed a learned input calibration (4.7 nonCjk chars/token) for the model.
+	it("estimates the first request with the learned shared calibration", () => {
+		// Seed the shared calibration so the punct ratio is clearly distinct
+		// from the default (2.2): tokens = Σ bucket / ratio, exactly.
 		const writer = new CalibrationCache({ dir: cacheDir });
 		const key = calibrationKey("prov", "model-x");
 		for (let i = 0; i < MIN_SAMPLES + 5; i++) {
-			const cjk = 2 + (i % 10);
-			const nonCjk = 100 + ((i * 71) % 900);
-			writer.recordInput(key, cjk, nonCjk, cjk / 1.3 + nonCjk / 4.7);
+			const counts = {
+				cjk: 5 + (i % 30),
+				word: 100 + ((i * 37) % 900),
+				digit: 3 + (i % 7),
+				punct: 10 + ((i * 11) % 40),
+				space: 8 + (i % 15),
+			};
+			const tokens =
+				counts.cjk / 1.2 + counts.word / 4.0 + counts.digit / 2.5 + counts.punct / 6.0 + counts.space / 5.0;
+			writer.record(key, counts, tokens);
 		}
 
 		const h = registerFeature();
@@ -418,33 +428,63 @@ describe("token-speed feature wiring", () => {
 			payload: { model: "model-x", messages: [{ role: "user", content: "x.".repeat(1900) }] },
 		});
 		vi.advanceTimersByTime(100);
-		// 3811 counted chars (payload strings incl. role/model) / 4.7 ≈ 811 —
-		// not the default-ratio 3811/3.8 ≈ 1003.
-		expect(h.statuses.get("my-pi")).toBe("I811 F0.1s");
+		// Payload counts: 1934 word chars + 1928 punct chars (keys + JSON syntax
+		// included) → 1934/4.0 + 1928/6.0 ≈ 805, not the default ≈ 1360.
+		expect(h.statuses.get("my-pi")).toBe("I805 F0.1s");
 	});
 
-	it("records input calibration from the authoritative prompt total", () => {
+	it("rebases the input estimate on the authoritative prompt total and records Δ samples", () => {
 		const h = registerFeature();
+		// Request 1: no anchor yet → full-payload estimate on defaults.
 		h.emit("before_provider_request", {
 			type: "before_provider_request",
-			payload: { model: "model-x", messages: [{ role: "user", content: "x.".repeat(1900) }] },
+			payload: { model: "model-x", messages: [{ role: "user", content: "hi" }] },
 		});
 		h.emit("message_start", { message: assistantMessage() });
 		vi.setSystemTime(START + 100);
 		h.emit("message_update", {
 			message: assistantMessage(),
-			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(40) },
+			assistantMessageEvent: { type: "text_delta", delta: "x" },
 		});
 		h.emit("message_end", {
-			message: assistantMessage({ usage: { output: 100, input: 500, cacheRead: 1000 } }),
+			message: assistantMessage({ usage: { output: 10, input: 400, cacheRead: 600 } }),
 		});
 
+		// Request 2: grows the payload by a second message with 3800 chars.
+		h.emit("before_provider_request", {
+			type: "before_provider_request",
+			payload: {
+				model: "model-x",
+				messages: [
+					{ role: "user", content: "hi" },
+					{ role: "user", content: "x.".repeat(1900) },
+				],
+			},
+		});
+		vi.advanceTimersByTime(100);
+		// Rebased: 1000 (authoritative) + Δ: 1915 word/4.0 + 1911 punct/2.2 ≈
+		// 1000 + 478.75 + 868.64 = 2347.
+		expect(h.statuses.get("my-pi")).toBe("I2.3k F0.1s");
+		h.emit("message_start", { message: assistantMessage() });
+		vi.setSystemTime(START + 200);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x" },
+		});
+		h.emit("message_end", {
+			message: assistantMessage({ usage: { output: 10, input: 1400, cacheRead: 600 } }),
+		});
+
+		// The Δ pair (second message's chars vs +1000 tokens) trains the shared
+		// calibration; the first authoritative request only anchors. The two
+		// visible-output samples (1 streamed "x" each) land in the same pool.
 		const reader = new CalibrationCache({ dir: cacheDir });
 		reader.load();
-		const stats = reader.inputStats(calibrationKey("prov", "model-x"));
-		expect(stats?.n).toBe(1);
-		expect(stats?.sumNonCjk).toBe(3811); // 3800 payload chars + role/model strings
-		expect(stats?.sumOut).toBe(1500); // input + cacheRead
+		const stats = reader.stats(calibrationKey("prov", "model-x"));
+		expect(stats?.n).toBe(3);
+		expect(stats?.sums[1]).toBe(1917); // word: Δ 1915 + 2 streamed chars
+		expect(stats?.sums[3]).toBe(1914); // punct: Δ JSON syntax + 1900 dots
+		expect(stats?.sumTokens).toBe(1020); // Δ +1000, outputs +10 each
 	});
 
 	it("shows the previous message's average speed while waiting for the first token", () => {
@@ -471,7 +511,7 @@ describe("token-speed feature wiring", () => {
 			payload: { model: "model-x", messages: [{ role: "user", content: "x.".repeat(1900) }] },
 		});
 		vi.advanceTimersByTime(100);
-		expect(h.statuses.get("my-pi")).toBe("I1.0k F0.1s ~182 TPS");
+		expect(h.statuses.get("my-pi")).toBe("I1.4k F0.1s ~182 TPS");
 	});
 
 	it("highlights live parts and dims static parts", () => {
@@ -485,7 +525,7 @@ describe("token-speed feature wiring", () => {
 			payload: { messages: [{ content: "x.".repeat(1900) }] },
 		});
 		vi.advanceTimersByTime(100);
-		expect(statuses.get("my-pi")).toBe("<dim>I1.0k</dim> <accent>F0.1s</accent>");
+		expect(statuses.get("my-pi")).toBe("<dim>I1.3k</dim> <accent>F0.1s</accent>");
 
 		emit("message_start", { message: assistantMessage() });
 		vi.setSystemTime(START + 100);
@@ -499,7 +539,7 @@ describe("token-speed feature wiring", () => {
 			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
 		});
 		expect(statuses.get("my-pi")).toBe(
-			"<dim>I1.0k</dim> <dim>F0.1s</dim> <accent>O200</accent> <accent>~667 TPS</accent>",
+			"<dim>I1.3k</dim> <dim>F0.1s</dim> <accent>O190</accent> <accent>~633 TPS</accent>",
 		);
 	});
 

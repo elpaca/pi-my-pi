@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Calibration } from "./estimator.ts";
 import { parseLastStats, StreamMetrics } from "./metrics.ts";
 
-const CALIBRATION = { cjkCharsPerToken: 1.0, nonCjkCharsPerToken: 4.0 } as const satisfies Calibration;
+const CALIBRATION = { cjk: 1.0, word: 4.0, digit: 4.0, punct: 4.0, space: 4.0 } as const satisfies Calibration;
 const T0 = 1_000_000;
 
 function feedCompleteMessage(
@@ -34,7 +34,7 @@ describe("StreamMetrics", () => {
 		expect(stats?.reasoningTokens).toBe(4);
 		expect(stats?.avgTps).toBeCloseTo(16 / 3, 5); // (output − hidden reasoning) / decode window
 		expect(stats?.estimated).toBe(false);
-		expect(stats?.chars).toEqual({ cjk: 0, nonCjk: 24 }); // 4 deltas × "hello "
+		expect(stats?.chars).toEqual({ cjk: 0, word: 20, digit: 0, punct: 0, space: 4 }); // 4 deltas × "hello "
 		expect(metrics.stats).toBe(stats);
 	});
 
@@ -123,7 +123,7 @@ describe("StreamMetrics", () => {
 		metrics.onDelta("x", "text", T0 + 500);
 		const young = metrics.liveSample(T0 + 600);
 		expect(young?.tps).toBeNull(); // < 250ms since first delta: no rate yet
-		expect(young?.estimatedTokens).toBeCloseTo(1 / 3.8, 5); // cumulative estimate still valid
+		expect(young?.estimatedTokens).toBeCloseTo(1 / 4, 5); // cumulative estimate still valid
 
 		metrics.onDelta("x".repeat(32), "text", T0 + 600); // 33 chars total → ~8 tokens
 		const sample = metrics.liveSample(T0 + 1500, CALIBRATION);

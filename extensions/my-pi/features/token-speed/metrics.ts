@@ -1,4 +1,13 @@
-import { type Calibration, type CharCounts, countChars, countTotalChars, estimateTokens } from "./estimator.ts";
+import {
+	addCounts,
+	BUCKET_KEYS,
+	type Calibration,
+	type CharCounts,
+	countTextChars,
+	countTotalChars,
+	estimateTokens,
+	zeroCounts,
+} from "./estimator.ts";
 
 /** Stats of the most recently completed assistant message; persisted and restored across sessions. */
 export interface LastMessageStats {
@@ -99,10 +108,10 @@ export class StreamMetrics {
 	private messageStartMs: number | null = null;
 	private firstDeltaMs: number | null = null;
 	private lastDeltaMs: number | null = null;
-	private chars: CharCounts = { cjk: 0, nonCjk: 0 };
-	private thinkingChars: CharCounts = { cjk: 0, nonCjk: 0 };
+	private chars: CharCounts = zeroCounts();
+	private thinkingChars: CharCounts = zeroCounts();
 	/** Non-thinking (text + toolcall) streamed chars: the O slot excludes thinking. */
-	private outputChars: CharCounts = { cjk: 0, nonCjk: 0 };
+	private outputChars: CharCounts = zeroCounts();
 	private hasDelta = false;
 	/** Estimated cached-context tokens of the current request; set per request, survives message starts. */
 	private requestInputTokens: number | null = null;
@@ -113,9 +122,9 @@ export class StreamMetrics {
 	 */
 	private liveAnchorMs: number | null = null;
 	/** Cumulative char counts at liveAnchorMs; window fallback when no entry precedes the cutoff. */
-	private segmentBase: CharCounts = { cjk: 0, nonCjk: 0 };
-	/** Cumulative char counts at each delta, pruned to the live window; feeds the sliding-window rate. */
-	private charLog: Array<{ t: number; cjk: number; nonCjk: number }> = [];
+	private segmentBase: CharCounts = zeroCounts();
+	/** Cumulative bucket counts at each delta, pruned to the live window; feeds the sliding-window rate. */
+	private charLog: Array<{ t: number; c: CharCounts }> = [];
 	private lastStats: LastMessageStats | undefined;
 
 	/** Drop all state, including the restored last-message stats. */
@@ -124,13 +133,13 @@ export class StreamMetrics {
 		this.messageStartMs = null;
 		this.firstDeltaMs = null;
 		this.lastDeltaMs = null;
-		this.chars = { cjk: 0, nonCjk: 0 };
-		this.thinkingChars = { cjk: 0, nonCjk: 0 };
-		this.outputChars = { cjk: 0, nonCjk: 0 };
+		this.chars = zeroCounts();
+		this.thinkingChars = zeroCounts();
+		this.outputChars = zeroCounts();
 		this.hasDelta = false;
 		this.requestInputTokens = null;
 		this.liveAnchorMs = null;
-		this.segmentBase = { cjk: 0, nonCjk: 0 };
+		this.segmentBase = zeroCounts();
 		this.charLog = [];
 		this.lastStats = undefined;
 	}
@@ -168,12 +177,12 @@ export class StreamMetrics {
 		this.messageStartMs = now;
 		this.firstDeltaMs = null;
 		this.lastDeltaMs = null;
-		this.chars = { cjk: 0, nonCjk: 0 };
-		this.thinkingChars = { cjk: 0, nonCjk: 0 };
-		this.outputChars = { cjk: 0, nonCjk: 0 };
+		this.chars = zeroCounts();
+		this.thinkingChars = zeroCounts();
+		this.outputChars = zeroCounts();
 		this.hasDelta = false;
 		this.liveAnchorMs = null;
-		this.segmentBase = { cjk: 0, nonCjk: 0 };
+		this.segmentBase = zeroCounts();
 		this.charLog = [];
 	}
 
@@ -184,27 +193,20 @@ export class StreamMetrics {
 			this.firstDeltaMs = now;
 			this.hasDelta = true;
 			this.liveAnchorMs = now;
-			this.segmentBase = { cjk: 0, nonCjk: 0 };
+			this.segmentBase = zeroCounts();
 		} else if (this.lastDeltaMs !== null && now - this.lastDeltaMs >= LIVE_WINDOW_MS) {
 			// Delivery gap of at least one full window (hidden reasoning stall,
 			// buffering relay): the running window cannot describe the resumed
 			// stream, so start a fresh measurement segment here.
 			this.liveAnchorMs = now;
 			this.segmentBase = { ...this.chars };
-			this.charLog = [{ t: now, cjk: this.chars.cjk, nonCjk: this.chars.nonCjk }];
+			this.charLog = [{ t: now, c: { ...this.chars } }];
 		}
 		this.lastDeltaMs = now;
-		const counts = countChars(text);
-		this.chars.cjk += counts.cjk;
-		this.chars.nonCjk += counts.nonCjk;
-		if (kind === "thinking") {
-			this.thinkingChars.cjk += counts.cjk;
-			this.thinkingChars.nonCjk += counts.nonCjk;
-		} else {
-			this.outputChars.cjk += counts.cjk;
-			this.outputChars.nonCjk += counts.nonCjk;
-		}
-		this.charLog.push({ t: now, cjk: this.chars.cjk, nonCjk: this.chars.nonCjk });
+		const counts = countTextChars(text);
+		addCounts(this.chars, counts);
+		addCounts(kind === "thinking" ? this.thinkingChars : this.outputChars, counts);
+		this.charLog.push({ t: now, c: { ...this.chars } });
 		// Keep at most one entry at or before the window start; it serves as the baseline.
 		while (this.charLog.length >= 2 && (this.charLog[1]?.t ?? Infinity) <= now - LIVE_WINDOW_MS) {
 			this.charLog.shift();
@@ -230,17 +232,17 @@ export class StreamMetrics {
 		// Window baseline: last cumulative entry at or before the cutoff; when the
 		// window reaches back to the segment start (warm-up or fresh segment), the
 		// cumulative counts at the segment anchor.
-		let baseCjk = this.segmentBase.cjk;
-		let baseNonCjk = this.segmentBase.nonCjk;
+		let base: CharCounts = this.segmentBase;
 		for (let i = this.charLog.length - 1; i >= 0; i--) {
 			const entry = this.charLog[i];
 			if (entry && entry.t <= cutoff) {
-				baseCjk = entry.cjk;
-				baseNonCjk = entry.nonCjk;
+				base = entry.c;
 				break;
 			}
 		}
-		const windowTokens = estimateTokens({ cjk: last.cjk - baseCjk, nonCjk: last.nonCjk - baseNonCjk }, calibration);
+		const windowCounts: CharCounts = zeroCounts();
+		for (const key of BUCKET_KEYS) windowCounts[key] = last.c[key] - base[key];
+		const windowTokens = estimateTokens(windowCounts, calibration);
 		const anchor = this.resolveRequestStart();
 		// The rate needs a minimum integration window; the cumulative counters
 		// (C/T/O) are valid from the first delta on.
@@ -363,7 +365,20 @@ export function parseLastStats(data: unknown): LastMessageStats | undefined {
 	if (!num(d.outputTokens) || !num(d.endedAt)) return undefined;
 	if (typeof d.estimated !== "boolean") return undefined;
 	const chars = d.chars as Record<string, unknown> | undefined;
-	if (!chars || !num(chars.cjk) || !num(chars.nonCjk)) return undefined;
+	const validBuckets = chars !== undefined && BUCKET_KEYS.every((k) => num(chars[k]));
+	// Entries persisted by the two-bucket estimator keep their stats
+	// displayable, but with zeroed chars (learning is skipped for them).
+	const legacyChars = chars !== undefined && num(chars.cjk) && num(chars.nonCjk);
+	if (!chars || (!validBuckets && !legacyChars)) return undefined;
+	const charCounts: CharCounts = validBuckets
+		? {
+				cjk: num(chars.cjk) ? chars.cjk : 0,
+				word: num(chars.word) ? chars.word : 0,
+				digit: num(chars.digit) ? chars.digit : 0,
+				punct: num(chars.punct) ? chars.punct : 0,
+				space: num(chars.space) ? chars.space : 0,
+			}
+		: zeroCounts();
 	const reasoningTokens = num(d.reasoningTokens) ? d.reasoningTokens : 0;
 	const optNum = (value: unknown): number | undefined => (num(value) && value >= 0 ? value : undefined);
 	const thinkingEstimatedTokens = optNum(d.thinkingEstimatedTokens);
@@ -381,7 +396,7 @@ export function parseLastStats(data: unknown): LastMessageStats | undefined {
 		estimated: d.estimated,
 		...(thinkingEstimatedTokens !== undefined ? { thinkingEstimatedTokens } : {}),
 		...(inputTokens !== undefined ? { inputTokens, inputEstimated } : {}),
-		chars: { cjk: chars.cjk, nonCjk: chars.nonCjk },
+		chars: charCounts,
 		endedAt: d.endedAt,
 	};
 	// Entries persisted before hidden-reasoning handling divided the full

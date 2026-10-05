@@ -1,5 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { countChars, countTotalChars, DEFAULT_CALIBRATION, estimateTokens, isCjkCodePoint } from "./estimator.ts";
+import {
+	BUCKET_KEYS,
+	classifyCodePoint,
+	countPayloadChars,
+	countTextChars,
+	countTotalChars,
+	DEFAULT_CALIBRATION,
+	estimateTokens,
+	isCjkCodePoint,
+	isZeroCounts,
+	subCounts,
+} from "./estimator.ts";
 
 describe("isCjkCodePoint", () => {
 	it.each([
@@ -21,40 +32,107 @@ describe("isCjkCodePoint", () => {
 	});
 });
 
-describe("countChars", () => {
-	it("counts CJK and non-CJK code points", () => {
-		expect(countChars("hello world")).toEqual({ cjk: 0, nonCjk: 11 });
-		expect(countChars("你好，世界")).toEqual({ cjk: 5, nonCjk: 0 }); // fullwidth comma counts as CJK
-		expect(countChars("使用 TypeScript 写代码")).toEqual({ cjk: 5, nonCjk: 12 });
+describe("classifyCodePoint", () => {
+	it.each([
+		[0x41, "word"], // A
+		[0x5f, "word"], // _ (identifier glue tokenizes like letters)
+		[0x30, "digit"], // 0
+		[0x39, "digit"], // 9
+		[0x20, "space"],
+		[0x0a, "space"], // newline
+		[0x3d, "punct"], // =
+		[0x7b, "punct"], // {
+		[0x22, "punct"], // "
+		[0x4e00, "cjk"], // 一
+		[0xff10, "cjk"], // ０ fullwidth digit (CJK block)
+		[0x00e9, "word"], // é
+		[0x0431, "word"], // б cyrillic
+	])("classifies U+%s as %s", (cp, expected) => {
+		expect(classifyCodePoint(cp)).toBe(expected);
+	});
+});
+
+describe("countTextChars", () => {
+	it("classifies code points into the five buckets", () => {
+		expect(countTextChars("hello world")).toEqual({ cjk: 0, word: 10, digit: 0, punct: 0, space: 1 });
+		// fullwidth comma counts as CJK
+		expect(countTextChars("你好，世界")).toEqual({ cjk: 5, word: 0, digit: 0, punct: 0, space: 0 });
+		// 使用(2) + space + TypeScript(10) + space + 写(1) + 代码(2)
+		expect(countTextChars("使用 TypeScript 写代码")).toEqual({
+			cjk: 5,
+			word: 10,
+			digit: 0,
+			punct: 0,
+			space: 2,
+		});
+		// v(1) 1(2).(3) 2(4) space {(5) a(6) :(7) 1(8) }(9)
+		expect(countTextChars("v1.2 {a:1}")).toEqual({ cjk: 0, word: 2, digit: 3, punct: 4, space: 1 });
 	});
 
 	it("counts astral (surrogate pair) characters once", () => {
-		expect(countChars("𝄞𝄞")).toEqual({ cjk: 0, nonCjk: 2 });
-		expect(countChars("\u{20000}\u{20000}")).toEqual({ cjk: 2, nonCjk: 0 }); // Ext B
+		expect(countTextChars("𝄞𝄞")).toEqual({ cjk: 0, word: 2, digit: 0, punct: 0, space: 0 });
+		expect(countTextChars("\u{20000}\u{20000}")).toEqual({ cjk: 2, word: 0, digit: 0, punct: 0, space: 0 });
 	});
 
 	it("handles empty strings", () => {
-		expect(countChars("")).toEqual({ cjk: 0, nonCjk: 0 });
-		expect(countTotalChars({ cjk: 0, nonCjk: 0 })).toBe(0);
+		expect(countTextChars("")).toEqual({ cjk: 0, word: 0, digit: 0, punct: 0, space: 0 });
+		expect(countTotalChars(countTextChars(""))).toBe(0);
+	});
+});
+
+describe("countPayloadChars", () => {
+	it("counts values, keys, and JSON syntax of the serialized payload", () => {
+		const counts = countPayloadChars({ role: "user", content: "hi" });
+		// {"role":"user","content":"hi"} — 17 letters ("role","user","content","hi") + 13 syntax chars
+		expect(counts.word).toBe(17);
+		expect(counts.punct).toBe(13);
+		expect(countTotalChars(counts)).toBe(30);
+	});
+
+	it("blanks out data URLs and base64 blobs", () => {
+		const base64 = "A".repeat(2048);
+		const counts = countPayloadChars({ type: "image", data: base64, url: "data:image/png;base64,AAAA" });
+		// → {"type":"image","data":"","url":""}: 16 letters + 19 syntax chars
+		expect(counts.word).toBe(16);
+		expect(counts.punct).toBe(19);
+		expect(countTotalChars(counts)).toBe(35);
+	});
+
+	it("returns zero counts for null/undefined payloads", () => {
+		expect(isZeroCounts(countPayloadChars(undefined))).toBe(true);
+		expect(isZeroCounts(countPayloadChars(null))).toBe(true);
 	});
 });
 
 describe("estimateTokens", () => {
 	it("uses default calibration ratios", () => {
-		// 13 CJK / 1.3 = 10 tokens; 38 non-CJK / 3.8 = 10 tokens
-		expect(estimateTokens({ cjk: 13, nonCjk: 38 })).toBeCloseTo(20, 5);
-		expect(estimateTokens({ cjk: 0, nonCjk: 0 })).toBe(0);
+		// 13 CJK / 1.3 = 10 tokens; each other bucket contributes 10 tokens
+		const counts = { cjk: 13, word: 40, digit: 25, punct: 22, space: 50 };
+		expect(estimateTokens(counts)).toBeCloseTo(50, 5);
+		expect(estimateTokens({ cjk: 0, word: 0, digit: 0, punct: 0, space: 0 })).toBe(0);
 	});
 
 	it("applies a custom calibration", () => {
-		const calibration = { cjkCharsPerToken: 1.0, nonCjkCharsPerToken: 4.0 };
-		expect(estimateTokens({ cjk: 10, nonCjk: 40 }, calibration)).toBeCloseTo(20, 5);
+		const calibration = { cjk: 1.0, word: 4.0, digit: 2.5, punct: 2.2, space: 5.0 };
+		expect(estimateTokens({ cjk: 10, word: 40, digit: 0, punct: 0, space: 0 }, calibration)).toBeCloseTo(20, 5);
 	});
 
 	it("falls back to defaults for invalid calibration ratios", () => {
-		const broken = { cjkCharsPerToken: 0, nonCjkCharsPerToken: -1 };
-		expect(estimateTokens({ cjk: 13, nonCjk: 38 }, broken)).toBe(
-			estimateTokens({ cjk: 13, nonCjk: 38 }, DEFAULT_CALIBRATION),
+		const broken = { cjk: 0, word: -1, digit: 2.5, punct: 2.2, space: 5.0 };
+		expect(estimateTokens({ cjk: 13, word: 40, digit: 0, punct: 0, space: 0 }, broken)).toBe(
+			estimateTokens({ cjk: 13, word: 40, digit: 0, punct: 0, space: 0 }, DEFAULT_CALIBRATION),
 		);
+	});
+
+	it("is linear, so signed (delta) counts estimate increments", () => {
+		const a = { cjk: 100, word: 400, digit: 0, punct: 0, space: 0 };
+		const b = { cjk: 60, word: 250, digit: 0, punct: 0, space: 0 };
+		const delta = subCounts(a, b);
+		expect(estimateTokens(delta)).toBeCloseTo(estimateTokens(a) - estimateTokens(b), 6);
+		expect(estimateTokens(delta)).toBeGreaterThan(0);
+	});
+
+	it("covers every bucket key exactly", () => {
+		expect(BUCKET_KEYS).toEqual(["cjk", "word", "digit", "punct", "space"]);
 	});
 });

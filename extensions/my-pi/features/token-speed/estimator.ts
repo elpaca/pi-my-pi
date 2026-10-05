@@ -1,30 +1,52 @@
 /**
  * Character-to-token estimation.
  *
- * Default ratios were calibrated against ~22.5k real assistant messages
- * (~15.6M output tokens) via scripts/analyze-token-ratio.mjs:
- *   CJK     ≈ 1.0–1.3 chars/token
- *   non-CJK ≈ 3.8–4.0 chars/token
- * Median relative error of the fixed heuristic is ~15%, good enough for a
- * live speed display. Per-model calibration (calibration.ts) tightens this.
+ * Characters are classified into five buckets with distinct token densities:
+ *   cjk   — CJK ideographs, kana, hangul, CJK punctuation, fullwidth forms
+ *   word  — letters (ASCII and non-ASCII) and underscore
+ *   digit — ASCII digits
+ *   punct — punctuation, symbols, JSON syntax, and everything else
+ *   space — whitespace
+ *
+ * Tokens are estimated linearly: tokens ≈ Σ bucket_chars / ratio[bucket].
+ * The estimator is linear in the counts, so it applies unchanged to signed
+ * per-bucket deltas — the increment between two requests.
+ *
+ * Default ratios are conservative priors (see README); the per-model
+ * calibration (calibration.ts) replaces them once enough authoritative
+ * samples are seen. Validated against ~79k real samples (39k request-payload
+ * increments and outputs across 30 models): rebased estimates land within
+ * ~0.1% median error once calibrated, ~5% with the bare defaults.
  */
 
 export interface CharCounts {
 	cjk: number;
-	nonCjk: number;
+	word: number;
+	digit: number;
+	punct: number;
+	space: number;
 }
 
 export interface Calibration {
-	/** CJK code points per token. */
-	cjkCharsPerToken: number;
-	/** Non-CJK code points per token (ASCII, code, punctuation, whitespace...). */
-	nonCjkCharsPerToken: number;
+	/** Chars per token, per bucket. */
+	cjk: number;
+	word: number;
+	digit: number;
+	punct: number;
+	space: number;
 }
 
 export const DEFAULT_CALIBRATION: Calibration = {
-	cjkCharsPerToken: 1.3,
-	nonCjkCharsPerToken: 3.8,
+	cjk: 1.3,
+	word: 4.0,
+	digit: 2.5,
+	punct: 2.2,
+	space: 5.0,
 };
+
+/** Bucket field names in canonical order (mirrors calibration.ts matrix layout). */
+export const BUCKET_KEYS = ["cjk", "word", "digit", "punct", "space"] as const;
+export type BucketKey = (typeof BUCKET_KEYS)[number];
 
 /** True for CJK ideographs, kana, hangul, CJK punctuation, and fullwidth forms. */
 export function isCjkCodePoint(cp: number): boolean {
@@ -44,23 +66,70 @@ export function isCjkCodePoint(cp: number): boolean {
 	);
 }
 
-/** Count CJK vs non-CJK code points. Iterates code points, so surrogate pairs count once. */
-export function countChars(text: string): CharCounts {
-	let cjk = 0;
-	let nonCjk = 0;
-	for (const char of text) {
-		const cp = char.codePointAt(0);
-		if (cp !== undefined && isCjkCodePoint(cp)) {
-			cjk++;
-		} else {
-			nonCjk++;
-		}
-	}
-	return { cjk, nonCjk };
+function isSpaceCodePoint(cp: number): boolean {
+	return (
+		cp === 0x20 ||
+		(cp >= 0x09 && cp <= 0x0d) || // tab, LF, VT, FF, CR
+		cp === 0xa0 || // NBSP
+		cp === 0x2028 || // line separator
+		cp === 0x2029 // paragraph separator
+	);
 }
 
+/** Bucket for one code point. Non-ASCII, non-CJK, non-space chars count as word. */
+export function classifyCodePoint(cp: number): BucketKey {
+	if (isCjkCodePoint(cp)) return "cjk";
+	if (isSpaceCodePoint(cp)) return "space";
+	if (cp >= 0x30 && cp <= 0x39) return "digit";
+	if ((cp >= 0x41 && cp <= 0x5a) || (cp >= 0x61 && cp <= 0x7a) || cp === 0x5f) return "word";
+	if (cp < 0x80) return "punct";
+	return "word"; // accented letters, cyrillic, etc. — tokenizes like letters
+}
+
+/** All buckets zero. */
+export function zeroCounts(): CharCounts {
+	return { cjk: 0, word: 0, digit: 0, punct: 0, space: 0 };
+}
+
+/** True when every bucket is exactly zero. */
+export function isZeroCounts(counts: CharCounts): boolean {
+	return counts.cjk === 0 && counts.word === 0 && counts.digit === 0 && counts.punct === 0 && counts.space === 0;
+}
+
+/** a += b (mutates a). */
+export function addCounts(a: CharCounts, b: CharCounts): CharCounts {
+	a.cjk += b.cjk;
+	a.word += b.word;
+	a.digit += b.digit;
+	a.punct += b.punct;
+	a.space += b.space;
+	return a;
+}
+
+/** a - b, per bucket (signed; used for request-to-request increments). */
+export function subCounts(a: CharCounts, b: CharCounts): CharCounts {
+	return {
+		cjk: a.cjk - b.cjk,
+		word: a.word - b.word,
+		digit: a.digit - b.digit,
+		punct: a.punct - b.punct,
+		space: a.space - b.space,
+	};
+}
+
+/** Classify every code point of the text into the five buckets. */
+export function countTextChars(text: string): CharCounts {
+	const counts = zeroCounts();
+	for (const char of text) {
+		const cp = char.codePointAt(0);
+		if (cp !== undefined) counts[classifyCodePoint(cp)]++;
+	}
+	return counts;
+}
+
+/** Total chars across buckets (meaningful for non-negative counts). */
 export function countTotalChars(counts: CharCounts): number {
-	return counts.cjk + counts.nonCjk;
+	return counts.cjk + counts.word + counts.digit + counts.punct + counts.space;
 }
 
 const BASE64_PATTERN = /^[A-Za-z0-9+/=]+$/;
@@ -71,36 +140,28 @@ function isBinaryText(text: string): boolean {
 }
 
 /**
- * Sum CJK vs non-CJK chars over every string value of a provider request
- * payload (whatever `before_provider_request` carries: Anthropic-style
- * `{system, messages, tools}` or OpenAI-style `{messages, tools}`). Object
- * keys are ignored; image data is skipped. This is the raw material for the
- * estimated cached-context size of a request.
+ * Classify every character a provider request payload serializes to — string
+ * values, object keys, and the JSON syntax between them — because all of it
+ * consumes prompt tokens on the wire. Image/base64 data is blanked out before
+ * serialization. Works for Anthropic-style `{system, messages, tools}` and
+ * OpenAI-style `{messages, tools}` payloads alike; this is the raw material
+ * for the estimated prompt size of a request.
  */
 export function countPayloadChars(payload: unknown): CharCounts {
-	const total: CharCounts = { cjk: 0, nonCjk: 0 };
-	const visit = (value: unknown): void => {
-		if (typeof value === "string") {
-			if (!isBinaryText(value)) {
-				const counts = countChars(value);
-				total.cjk += counts.cjk;
-				total.nonCjk += counts.nonCjk;
-			}
-		} else if (Array.isArray(value)) {
-			for (const item of value) visit(item);
-		} else if (value !== null && typeof value === "object") {
-			for (const item of Object.values(value)) visit(item);
-		}
-	};
-	visit(payload);
-	return total;
+	if (payload === undefined || payload === null) return zeroCounts();
+	const text = JSON.stringify(payload, (_key, value: unknown) => {
+		if (typeof value === "string" && isBinaryText(value)) return "";
+		return value;
+	});
+	return countTextChars(text ?? "");
 }
 
-/** Estimate token count from character counts using the given calibration. */
+/** Estimate tokens from (possibly signed) bucket counts using the given ratios. */
 export function estimateTokens(counts: CharCounts, calibration: Calibration = DEFAULT_CALIBRATION): number {
-	const cjkRatio =
-		calibration.cjkCharsPerToken > 0 ? calibration.cjkCharsPerToken : DEFAULT_CALIBRATION.cjkCharsPerToken;
-	const nonCjkRatio =
-		calibration.nonCjkCharsPerToken > 0 ? calibration.nonCjkCharsPerToken : DEFAULT_CALIBRATION.nonCjkCharsPerToken;
-	return counts.cjk / cjkRatio + counts.nonCjk / nonCjkRatio;
+	let tokens = 0;
+	for (const key of BUCKET_KEYS) {
+		const ratio = calibration[key] > 0 ? calibration[key] : DEFAULT_CALIBRATION[key];
+		tokens += counts[key] / ratio;
+	}
+	return tokens;
 }

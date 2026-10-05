@@ -131,7 +131,7 @@ describe("formatIdleSegments", () => {
 		estimated: false,
 		inputTokens: 115_000,
 		inputEstimated: false,
-		chars: { cjk: 0, nonCjk: 0 },
+		chars: { cjk: 0, word: 0, digit: 0, punct: 0, space: 0 },
 		endedAt: 0,
 		...overrides,
 	});
