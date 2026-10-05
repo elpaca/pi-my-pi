@@ -11,6 +11,16 @@ function truncate(text: string, width: number): string {
 	return text.length > width ? `${text.slice(0, width - 1)}…` : text;
 }
 
+/** A minimal TUI component rendering fixed lines (computed per width). */
+function staticText(lines: (width: number) => string[]) {
+	return {
+		render(width: number): string[] {
+			return lines(width);
+		},
+		invalidate(): void {},
+	};
+}
+
 function createInputSubmenu(
 	schema: SettingSchema,
 	store: SettingsStore,
@@ -33,13 +43,7 @@ function createInputSubmenu(
 
 	const container = new Container();
 	container.addChild(
-		new (class {
-			render(width: number): string[] {
-				return [schema.description ? truncate(schema.description, width) : `Set ${schema.label}`, ""];
-			}
-
-			invalidate(): void {}
-		})(),
+		staticText((width) => [schema.description ? truncate(schema.description, width) : `Set ${schema.label}`, ""]),
 	);
 	container.addChild(input);
 
@@ -106,15 +110,7 @@ async function openMenu(store: SettingsStore, ctx: ExtensionCommandContext): Pro
 		);
 
 		const container = new Container();
-		container.addChild(
-			new (class {
-				render(_width: number): string[] {
-					return [theme.fg("accent", theme.bold("my-pi settings")), ""];
-				}
-
-				invalidate(): void {}
-			})(),
-		);
+		container.addChild(staticText(() => [theme.fg("accent", theme.bold("my-pi settings")), ""]));
 		container.addChild(settingsList);
 
 		return {

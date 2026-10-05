@@ -103,7 +103,8 @@ export function formatIdleSegments(stats: LastMessageStats): StatusSegment[] {
 	if (input) segments.push(input);
 	const ttft = stats.ttftMs !== null ? `F${formatSeconds(stats.ttftMs)}` : null;
 	const tps = stats.avgTps !== null ? `${formatTps(stats.avgTps)}TPS` : null;
-	if (ttft !== null || tps !== null) {
+	const hasSpeedSlot = ttft !== null || tps !== null;
+	if (hasSpeedSlot) {
 		segments.push({ text: ttft ?? "FN/A", live: false });
 	}
 	const thinking = stats.reasoningTokens > 0 ? stats.reasoningTokens : (stats.thinkingEstimatedTokens ?? 0);
@@ -116,7 +117,7 @@ export function formatIdleSegments(stats: LastMessageStats): StatusSegment[] {
 	if (output > 0) {
 		segments.push({ text: `O${formatTokenCount(output)}`, live: false });
 	}
-	if (ttft !== null || tps !== null) {
+	if (hasSpeedSlot) {
 		segments.push({ text: tps ?? "N/A", live: false });
 	} else if (segments.length > 0) {
 		// No speed slot at all: a single N/A tail says the message ended

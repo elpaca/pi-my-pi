@@ -2,25 +2,12 @@ import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Feature } from "../../types.ts";
 import { CalibrationCache, calibrationKey } from "./calibration.ts";
-import {
-	type Calibration,
-	type CharCounts,
-	countPayloadChars,
-	countTotalChars,
-	DEFAULT_CALIBRATION,
-	estimateTokens,
-	isZeroCounts,
-	subCounts,
-} from "./estimator.ts";
-import { formatIdleSegments, formatStreamingSegments, formatWaitSegments, type StatusSegment } from "./format.ts";
-import { type LiveSample, parseLastStats, StreamMetrics } from "./metrics.ts";
+import { countPayloadChars, estimateInputTokens } from "./estimator.ts";
+import { LiveStatus } from "./live-status.ts";
+import { parseLastStats, StreamMetrics } from "./metrics.ts";
+import { CalibrationTrainer } from "./training.ts";
 
-const STATUS_KEY = "my-pi";
 const CUSTOM_TYPE = "my-pi.token-speed";
-/** Live status refresh throttle: at most once per second (event-driven, no timers). */
-const LIVE_UPDATE_INTERVAL_MS = 1000;
-/** Tick rate of the wait-phase elapsed counter (no stream events fire before the first delta). */
-const WAIT_TICK_MS = 100;
 
 type DeltaKind = "text" | "thinking" | "toolcall";
 
@@ -58,136 +45,39 @@ export const tokenSpeedFeature: Feature = {
 		const metrics = new StreamMetrics();
 		const cache = new CalibrationCache();
 		cache.load();
+		const trainer = new CalibrationTrainer(cache);
+		const isEnabled = (): boolean => settings.getBoolean("tokenSpeed.enabled");
+		const status = new LiveStatus({
+			metrics,
+			isEnabled,
+			showDuringStream: () => settings.getBoolean("tokenSpeed.showDuringStream"),
+		});
 
 		let lastCtx: ExtensionContext | undefined;
-		let lastLiveUpdateMs = 0;
-		let lastSample: LiveSample | undefined;
+		/** endedAt of the stats already persisted as a custom entry this session. */
 		let persistedEndedAt = 0;
-		/** Request-time payload chars, paired with the response's authoritative prompt total. */
-		let requestChars: CharCounts | undefined;
-		/**
-		 * Last authoritative prompt total of this session with the payload
-		 * chars it billed: the anchor for rebased input estimates and for Δ
-		 * training samples. Session-scoped on purpose — system prompt and tool
-		 * schemas are constant within a session and cancel in the increment.
-		 */
-		let lastAuthoritative: { tokens: number; chars: CharCounts } | undefined;
-
-		const isEnabled = (): boolean => settings.getBoolean("tokenSpeed.enabled");
-		const showDuringStream = (): boolean => settings.getBoolean("tokenSpeed.showDuringStream");
-
-		let waitTimer: ReturnType<typeof setInterval> | undefined;
-
-		const clearStatus = (ctx: ExtensionContext): void => {
-			ctx.ui.setStatus(STATUS_KEY, undefined);
-		};
-
-		/** Segments that update in real time highlight; static ones stay dim. */
-		const renderSegments = (ctx: ExtensionContext, segments: StatusSegment[]): string =>
-			segments.map((segment) => ctx.ui.theme.fg(segment.live ? "accent" : "dim", segment.text)).join(" ");
-
-		/** Tear down the wait-phase ticker; safe to call repeatedly. */
-		const stopWaitTimer = (): void => {
-			if (waitTimer === undefined) return;
-			clearInterval(waitTimer);
-			waitTimer = undefined;
-		};
-
-		/**
-		 * While waiting for the first delta no stream events fire, so the elapsed
-		 * counter needs its own ticker. It self-disarms when settings change
-		 * mid-wait, and is stopped on first delta / message end / shutdown.
-		 */
-		const startWaitTimer = (ctx: ExtensionContext, anchorMs: number): void => {
-			stopWaitTimer();
-			if (!isEnabled() || !showDuringStream()) return;
-			waitTimer = setInterval(() => {
-				if (!isEnabled() || !showDuringStream()) {
-					stopWaitTimer();
-					clearStatus(ctx);
-					return;
-				}
-				ctx.ui.setStatus(
-					STATUS_KEY,
-					renderSegments(
-						ctx,
-						// The previous message's average is the best speed
-						// reference available before the first token arrives.
-						formatWaitSegments(Date.now() - anchorMs, metrics.inputTokensEstimate, metrics.stats?.avgTps ?? null),
-					),
-				);
-			}, WAIT_TICK_MS);
-		};
-
-		const renderIdle = (ctx: ExtensionContext): void => {
-			if (!isEnabled()) return;
-			const stats = metrics.stats;
-			const segments = stats ? formatIdleSegments(stats) : [];
-			if (segments.length === 0) {
-				clearStatus(ctx);
-				return;
-			}
-			ctx.ui.setStatus(STATUS_KEY, renderSegments(ctx, segments));
-		};
-
-		const renderLive = (
-			ctx: ExtensionContext,
-			now: number,
-			calibration: Calibration | undefined,
-			partialUsage: number,
-		): void => {
-			if (!isEnabled() || !showDuringStream()) return;
-			const sample = metrics.liveSample(now, calibration, partialUsage);
-			if (!sample) return; // no deltas yet: the wait counter still owns the status
-			const rateJustBecameMeasurable = lastSample !== undefined && lastSample.tps === null && sample.tps !== null;
-			if (
-				!lastSample ||
-				lastLiveUpdateMs === 0 ||
-				rateJustBecameMeasurable ||
-				now - lastLiveUpdateMs >= LIVE_UPDATE_INTERVAL_MS
-			) {
-				lastSample = sample;
-				lastLiveUpdateMs = now;
-			}
-			// Token counters (C/T/O) refresh on every delta; ttft and the window
-			// rate come from the throttled sample so the speed figure stays put.
-			const throttled = lastSample;
-			const shown: LiveSample = { ...sample, ttftMs: throttled.ttftMs, tps: throttled.tps };
-			ctx.ui.setStatus(STATUS_KEY, renderSegments(ctx, formatStreamingSegments(shown)));
-		};
 
 		pi.on("before_provider_request", (event, ctx) => {
 			lastCtx = ctx;
 			const now = Date.now();
 			metrics.onRequestStart(now);
 			// Estimate the total input size (system + tools + messages) from the
-			// outgoing payload once per request. When this session already has an
-			// authoritative prompt total, REBASE on it: est = last + ratio·Δchars.
-			// The constant parts (system, tools, JSON overhead) cancel in the
-			// increment, which removes the dominant error source of full-payload
-			// estimates (validated offline: ~0.1% median vs ~40%+).
+			// outgoing payload once per request; static for the whole request
+			// (rebasing math lives in estimateInputTokens).
 			const model = ctx.model;
 			const requestKey = model ? calibrationKey(model.provider, model.id) : undefined;
-			const calibration = requestKey ? cache.get(requestKey) : undefined;
 			const chars = countPayloadChars(event.payload);
-			requestChars = chars;
-			let estimate: number | null = null;
-			if (countTotalChars(chars) > 0) {
-				const ratios = calibration ?? DEFAULT_CALIBRATION;
-				const tokens = lastAuthoritative
-					? lastAuthoritative.tokens + estimateTokens(subCounts(chars, lastAuthoritative.chars), ratios)
-					: estimateTokens(chars, ratios);
-				estimate = Math.round(tokens);
-			}
-			metrics.setInputEstimate(estimate);
-			startWaitTimer(ctx, now);
+			trainer.onRequestStart(chars);
+			metrics.setInputEstimate(
+				estimateInputTokens(chars, trainer.lastAuthoritative, requestKey ? cache.get(requestKey) : undefined),
+			);
+			status.startWait(ctx, now);
 		});
 
 		pi.on("message_start", (event, ctx) => {
 			lastCtx = ctx;
 			if (event.message.role !== "assistant") return;
-			lastSample = undefined;
-			lastLiveUpdateMs = 0;
+			status.onMessageStart();
 			metrics.onMessageStart(Date.now());
 		});
 
@@ -195,58 +85,32 @@ export const tokenSpeedFeature: Feature = {
 			lastCtx = ctx;
 			const message = event.message;
 			if (message.role !== "assistant") return;
-			const streamEvent = event.assistantMessageEvent;
-			const delta = extractDelta(streamEvent);
+			const delta = extractDelta(event.assistantMessageEvent);
 			const now = Date.now();
 			if (delta) {
-				if (waitTimer !== undefined) {
-					stopWaitTimer();
-					lastLiveUpdateMs = 0; // render the first live sample immediately
-				}
+				status.endWait(); // first delta: the live display takes over
 				metrics.onDelta(delta.text, delta.kind, now);
 			}
 			const key = calibrationKey(message.provider, message.model);
-			renderLive(ctx, now, cache.get(key), message.usage?.output ?? 0);
+			status.renderLive(ctx, now, cache.get(key), message.usage?.output ?? 0);
 		});
 
 		pi.on("message_end", (event, ctx) => {
 			lastCtx = ctx;
 			const message = event.message;
 			if (message.role !== "assistant") return;
-			stopWaitTimer();
+			status.stopWait();
 			const now = Date.now();
 			const key = calibrationKey(message.provider, message.model);
-			const calibration = cache.get(key);
-			const stats = metrics.onMessageEnd(message.usage, message.provider, message.model, now, calibration);
+			const stats = metrics.onMessageEnd(message.usage, message.provider, message.model, now, cache.get(key));
 			if (!stats) return;
-			// Only authoritative usage teaches the estimator anything, and only
-			// visible (streamed) tokens: hidden reasoning would poison the ratios.
-			const visibleTokens = stats.outputTokens - stats.reasoningTokens;
-			if (!stats.estimated && visibleTokens > 0 && countTotalChars(stats.chars) > 0) {
-				cache.record(key, stats.chars, visibleTokens, new Date(now));
-			}
-			// The authoritative prompt total (input + cacheRead + cacheWrite)
-			// anchors rebasing for the rest of the session, and its increment
-			// against the previous authoritative request trains the shared
-			// calibration (the constant parts cancel in the increment).
-			if (stats.inputEstimated === false && requestChars && countTotalChars(requestChars) > 0) {
-				const promptTokens = stats.inputTokens ?? 0;
-				if (lastAuthoritative) {
-					const deltaChars = subCounts(requestChars, lastAuthoritative.chars);
-					const deltaTokens = promptTokens - lastAuthoritative.tokens;
-					if (deltaTokens !== 0 && !isZeroCounts(deltaChars)) {
-						cache.record(key, deltaChars, deltaTokens, new Date(now));
-					}
-				}
-				lastAuthoritative = { tokens: promptTokens, chars: requestChars };
-			}
-			requestChars = undefined;
-			renderIdle(ctx);
+			trainer.onMessageEnd(key, stats, new Date(now));
+			status.renderIdle(ctx);
 		});
 
 		pi.on("agent_end", (_event, ctx) => {
 			lastCtx = ctx;
-			stopWaitTimer();
+			status.stopWait();
 		});
 
 		pi.on("turn_end", (_event, ctx) => {
@@ -260,10 +124,9 @@ export const tokenSpeedFeature: Feature = {
 
 		const restore = (ctx: ExtensionContext): void => {
 			lastCtx = ctx;
-			stopWaitTimer();
+			status.stopWait();
 			// A (new) session context has no authoritative prompt anchor yet.
-			lastAuthoritative = undefined;
-			requestChars = undefined;
+			trainer.reset();
 			const branch = ctx.sessionManager.getBranch();
 			for (let i = branch.length - 1; i >= 0; i--) {
 				const entry = branch[i];
@@ -275,7 +138,7 @@ export const tokenSpeedFeature: Feature = {
 				}
 				break;
 			}
-			renderIdle(ctx);
+			status.renderIdle(ctx);
 		};
 
 		pi.on("session_start", (_event, ctx) => {
@@ -287,23 +150,12 @@ export const tokenSpeedFeature: Feature = {
 		});
 
 		pi.on("session_shutdown", (_event, ctx) => {
-			stopWaitTimer();
-			clearStatus(ctx);
+			status.shutdown(ctx);
 		});
 
 		settings.onChange((key) => {
-			if (key !== "tokenSpeed.enabled" && key !== "tokenSpeed.showDuringStream") return;
 			const ctx = lastCtx;
-			if (!ctx) return;
-			const active = isEnabled() && (ctx.isIdle() || showDuringStream());
-			if (!active) {
-				stopWaitTimer();
-				clearStatus(ctx);
-				return;
-			}
-			if (ctx.isIdle()) {
-				renderIdle(ctx);
-			}
+			if (ctx) status.onSettingsChange(ctx, key);
 		});
 	},
 };

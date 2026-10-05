@@ -113,11 +113,14 @@ extensions/my-pi/
 ├── index.ts                     entry: registers features and /my-pi
 ├── types.ts                     shared Feature / SettingSchema types
 ├── settings.ts                  global settings store (JSON file, atomic writes)
+├── lib/fs.ts                    shared JSON read + atomic write helpers
 ├── commands/settings-menu.ts    /my-pi command + interactive menu
 └── features/token-speed/
-    ├── index.ts                 event wiring + status rendering
+    ├── index.ts                 event wiring
+    ├── live-status.ts           status-bar presentation (wait ticker, throttle, idle)
     ├── metrics.ts               timing/counter state machine
-    ├── estimator.ts             char→token estimation (CJK/non-CJK)
+    ├── estimator.ts             char→token estimation (CJK/non-CJK buckets)
+    ├── training.ts              per-message calibration sample collection
     ├── calibration.ts           per-model least-squares calibration cache
     └── format.ts                status text formatting
 scripts/analyze-token-ratio.mjs  offline calibration analysis over session files

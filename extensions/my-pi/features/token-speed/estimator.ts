@@ -27,14 +27,11 @@ export interface CharCounts {
 	space: number;
 }
 
-export interface Calibration {
-	/** Chars per token, per bucket. */
-	cjk: number;
-	word: number;
-	digit: number;
-	punct: number;
-	space: number;
-}
+/**
+ * Chars-per-token ratios, one per bucket. Structurally a CharCounts vector —
+ * both enter estimateTokens as plain bucket vectors (tokens ≈ Σ chars/ratio).
+ */
+export type Calibration = CharCounts;
 
 export const DEFAULT_CALIBRATION: Calibration = {
 	cjk: 1.3,
@@ -93,28 +90,20 @@ export function zeroCounts(): CharCounts {
 
 /** True when every bucket is exactly zero. */
 export function isZeroCounts(counts: CharCounts): boolean {
-	return counts.cjk === 0 && counts.word === 0 && counts.digit === 0 && counts.punct === 0 && counts.space === 0;
+	return BUCKET_KEYS.every((key) => counts[key] === 0);
 }
 
 /** a += b (mutates a). */
 export function addCounts(a: CharCounts, b: CharCounts): CharCounts {
-	a.cjk += b.cjk;
-	a.word += b.word;
-	a.digit += b.digit;
-	a.punct += b.punct;
-	a.space += b.space;
+	for (const key of BUCKET_KEYS) a[key] += b[key];
 	return a;
 }
 
 /** a - b, per bucket (signed; used for request-to-request increments). */
 export function subCounts(a: CharCounts, b: CharCounts): CharCounts {
-	return {
-		cjk: a.cjk - b.cjk,
-		word: a.word - b.word,
-		digit: a.digit - b.digit,
-		punct: a.punct - b.punct,
-		space: a.space - b.space,
-	};
+	const delta = zeroCounts();
+	for (const key of BUCKET_KEYS) delta[key] = a[key] - b[key];
+	return delta;
 }
 
 /** Classify every code point of the text into the five buckets. */
@@ -129,7 +118,7 @@ export function countTextChars(text: string): CharCounts {
 
 /** Total chars across buckets (meaningful for non-negative counts). */
 export function countTotalChars(counts: CharCounts): number {
-	return counts.cjk + counts.word + counts.digit + counts.punct + counts.space;
+	return BUCKET_KEYS.reduce((sum, key) => sum + counts[key], 0);
 }
 
 const BASE64_PATTERN = /^[A-Za-z0-9+/=]+$/;
@@ -164,4 +153,36 @@ export function estimateTokens(counts: CharCounts, calibration: Calibration = DE
 		tokens += counts[key] / ratio;
 	}
 	return tokens;
+}
+
+/**
+ * Authoritative prompt total of a past request, paired with the payload chars
+ * that were billed for it: the anchor for rebased input estimates and for Δ
+ * training samples. Session-scoped on purpose — system prompt and tool
+ * schemas are constant within a session and cancel in the increment.
+ */
+export interface InputAnchor {
+	tokens: number;
+	chars: CharCounts;
+}
+
+/**
+ * Estimate the total input tokens (system + tools + messages) of a request
+ * whose payload serializes to `chars`. When the session already has an
+ * authoritative prompt total (`anchor`), REBASE on it:
+ * est = anchor.tokens + ratio·Δchars. The constant parts (system, tools, JSON
+ * overhead) cancel in the increment, which removes the dominant error source
+ * of full-payload estimates (validated offline: ~0.1% median vs ~40%+).
+ * Returns null when the payload carries nothing countable.
+ */
+export function estimateInputTokens(
+	chars: CharCounts,
+	anchor: InputAnchor | undefined,
+	calibration?: Calibration,
+): number | null {
+	if (countTotalChars(chars) <= 0) return null;
+	const tokens = anchor
+		? anchor.tokens + estimateTokens(subCounts(chars, anchor.chars), calibration)
+		: estimateTokens(chars, calibration);
+	return Math.round(tokens);
 }

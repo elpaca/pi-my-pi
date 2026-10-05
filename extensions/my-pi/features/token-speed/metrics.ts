@@ -6,8 +6,18 @@ import {
 	countTextChars,
 	countTotalChars,
 	estimateTokens,
+	subCounts,
 	zeroCounts,
 } from "./estimator.ts";
+
+/** The subset of provider usage metrics StreamMetrics consumes. */
+export interface ProviderUsage {
+	output: number;
+	input?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	reasoning?: number;
+}
 
 /** Stats of the most recently completed assistant message; persisted and restored across sessions. */
 export interface LastMessageStats {
@@ -98,6 +108,48 @@ export const MIN_DECODE_MS = 500;
 
 /** Ignore request anchors that predate the message start by more than this (stale anchor from an aborted request). */
 const MAX_ANCHOR_SKEW_MS = 60_000;
+
+/**
+ * Window baseline for the sliding-window rate: the last cumulative entry at or
+ * before the cutoff; when the window reaches back to the segment start
+ * (warm-up or fresh segment), the cumulative counts at the segment anchor.
+ */
+function windowBaseline(
+	charLog: ReadonlyArray<{ t: number; c: CharCounts }>,
+	segmentBase: CharCounts,
+	cutoff: number,
+): CharCounts {
+	for (let i = charLog.length - 1; i >= 0; i--) {
+		const entry = charLog[i];
+		if (entry && entry.t <= cutoff) return entry.c;
+	}
+	return segmentBase;
+}
+
+/**
+ * Resolve the prompt-token total of a finished message. pi-ai normalizes
+ * usage.input to the *uncached* input across providers (OpenAI subtracts
+ * cached_tokens from prompt_tokens; Anthropic's input_tokens excludes cache
+ * read/write), so the total prompt the model saw is input + cacheRead +
+ * cacheWrite — the quantity the payload estimate approximates. Provider data
+ * is authoritative; otherwise fall back to the request-time estimate.
+ */
+function resolveInputTokens(
+	usage: ProviderUsage | undefined,
+	requestEstimate: number | null,
+): { inputTokens?: number; inputEstimated?: boolean } {
+	const input = Number.isFinite(usage?.input) ? Math.max(0, usage?.input ?? 0) : 0;
+	const cacheRead = Number.isFinite(usage?.cacheRead) ? Math.max(0, usage?.cacheRead ?? 0) : 0;
+	const cacheWrite = Number.isFinite(usage?.cacheWrite) ? Math.max(0, usage?.cacheWrite ?? 0) : 0;
+	const reportedInput = input + cacheRead + cacheWrite;
+	if (reportedInput > 0) {
+		return { inputTokens: reportedInput, inputEstimated: false };
+	}
+	if (requestEstimate !== null && requestEstimate > 0) {
+		return { inputTokens: requestEstimate, inputEstimated: true };
+	}
+	return {};
+}
 
 /**
  * Timing/counter state machine for one streaming assistant message.
@@ -225,24 +277,12 @@ export class StreamMetrics {
 	 */
 	liveSample(now: number, calibration?: Calibration, authoritativeTokens = 0): LiveSample | undefined {
 		if (this.firstDeltaMs === null || this.liveAnchorMs === null || this.charLog.length === 0) return undefined;
-		const elapsedMs = now - this.liveAnchorMs;
 		const last = this.charLog[this.charLog.length - 1];
 		if (!last) return undefined;
+		const elapsedMs = now - this.liveAnchorMs;
 		const cutoff = now - LIVE_WINDOW_MS;
-		// Window baseline: last cumulative entry at or before the cutoff; when the
-		// window reaches back to the segment start (warm-up or fresh segment), the
-		// cumulative counts at the segment anchor.
-		let base: CharCounts = this.segmentBase;
-		for (let i = this.charLog.length - 1; i >= 0; i--) {
-			const entry = this.charLog[i];
-			if (entry && entry.t <= cutoff) {
-				base = entry.c;
-				break;
-			}
-		}
-		const windowCounts: CharCounts = zeroCounts();
-		for (const key of BUCKET_KEYS) windowCounts[key] = last.c[key] - base[key];
-		const windowTokens = estimateTokens(windowCounts, calibration);
+		const base = windowBaseline(this.charLog, this.segmentBase, cutoff);
+		const windowTokens = estimateTokens(subCounts(last.c, base), calibration);
 		const anchor = this.resolveRequestStart();
 		// The rate needs a minimum integration window; the cumulative counters
 		// (C/T/O) are valid from the first delta on.
@@ -273,7 +313,7 @@ export class StreamMetrics {
 	 * nothing to report (no deltas, no authoritative tokens, no chars).
 	 */
 	onMessageEnd(
-		usage: { output: number; input?: number; cacheRead?: number; cacheWrite?: number; reasoning?: number } | undefined,
+		usage: ProviderUsage | undefined,
 		provider: string,
 		model: string,
 		now: number,
@@ -299,25 +339,9 @@ export class StreamMetrics {
 		const avgTps =
 			decodeMs !== null && decodeMs >= MIN_DECODE_MS && visibleTokens > 0 ? visibleTokens / (decodeMs / 1000) : null;
 
-		// Input: pi-ai normalizes usage.input to the *uncached* input across
-		// providers (OpenAI subtracts cached_tokens from prompt_tokens; Anthropic's
-		// input_tokens excludes cache read/write). The total prompt the model saw
-		// is input + cacheRead + cacheWrite — the quantity the payload estimate
-		// approximates. Provider data is authoritative; otherwise fall back to
-		// the request-time estimate.
-		const input = Number.isFinite(usage?.input) ? Math.max(0, usage?.input ?? 0) : 0;
-		const cacheRead = Number.isFinite(usage?.cacheRead) ? Math.max(0, usage?.cacheRead ?? 0) : 0;
-		const cacheWrite = Number.isFinite(usage?.cacheWrite) ? Math.max(0, usage?.cacheWrite ?? 0) : 0;
-		const reportedInput = input + cacheRead + cacheWrite;
-		let inputTokens: number | undefined;
-		let inputEstimated: boolean | undefined;
-		if (reportedInput > 0) {
-			inputTokens = reportedInput;
-			inputEstimated = false;
-		} else if (this.requestInputTokens !== null && this.requestInputTokens > 0) {
-			inputTokens = this.requestInputTokens;
-			inputEstimated = true;
-		}
+		// Input comes from the provider report when available, else from the
+		// request-time payload estimate (see resolveInputTokens).
+		const { inputTokens, inputEstimated } = resolveInputTokens(usage, this.requestInputTokens);
 		// Visible thinking is measured from streamed thinking deltas; only shown
 		// when the provider did not report an authoritative reasoning count.
 		const thinkingEstimatedTokens =
@@ -370,15 +394,13 @@ export function parseLastStats(data: unknown): LastMessageStats | undefined {
 	// displayable, but with zeroed chars (learning is skipped for them).
 	const legacyChars = chars !== undefined && num(chars.cjk) && num(chars.nonCjk);
 	if (!chars || (!validBuckets && !legacyChars)) return undefined;
-	const charCounts: CharCounts = validBuckets
-		? {
-				cjk: num(chars.cjk) ? chars.cjk : 0,
-				word: num(chars.word) ? chars.word : 0,
-				digit: num(chars.digit) ? chars.digit : 0,
-				punct: num(chars.punct) ? chars.punct : 0,
-				space: num(chars.space) ? chars.space : 0,
-			}
-		: zeroCounts();
+	const charCounts = zeroCounts();
+	if (validBuckets) {
+		for (const key of BUCKET_KEYS) {
+			const value = chars[key];
+			charCounts[key] = typeof value === "number" && Number.isFinite(value) ? value : 0;
+		}
+	}
 	const reasoningTokens = num(d.reasoningTokens) ? d.reasoningTokens : 0;
 	const optNum = (value: unknown): number | undefined => (num(value) && value >= 0 ? value : undefined);
 	const thinkingEstimatedTokens = optNum(d.thinkingEstimatedTokens);

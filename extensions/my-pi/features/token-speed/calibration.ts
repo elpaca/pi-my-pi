@@ -14,10 +14,10 @@
  * error, outputs at ~11-16% median, across 30 models.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { BUCKET_KEYS, type Calibration, type CharCounts, isZeroCounts } from "./estimator.ts";
+import { join } from "node:path";
+import { readJsonFile, writeFileAtomic } from "../../lib/fs.ts";
+import { BUCKET_KEYS, type Calibration, type CharCounts, isZeroCounts, zeroCounts } from "./estimator.ts";
 
 /** Samples required before the learned calibration replaces the defaults. */
 export const MIN_SAMPLES = 20;
@@ -91,54 +91,62 @@ export function addSample(
 }
 
 /**
- * Solve the DIM×DIM normal equations (partial pivoting) for the
- * tokens-per-char coefficients and return chars-per-token ratios. Returns
- * undefined when there is not enough data or the system is
+ * Solve the DIM×DIM normal equations (Gauss–Jordan elimination with partial
+ * pivoting) for the tokens-per-char coefficients and return chars-per-token
+ * ratios. Returns undefined when there is not enough data or the system is
  * degenerate/non-physical.
  */
 export function solveCalibration(stats: ModelCalibrationStats | undefined): Calibration | undefined {
 	if (!stats || stats.n < MIN_SAMPLES) return undefined;
 	const scale = Math.max(...stats.gram.flat().map(Math.abs));
 	if (!(scale > 0)) return undefined;
-	// Gaussian elimination with partial pivoting on the augmented matrix.
+
+	// Augmented matrix [gram | sy]. It is always DIM×(DIM+1); the cell()
+	// accessor absorbs noUncheckedIndexedAccess without polluting the algebra.
 	const m: number[][] = stats.gram.map((row, i) => [...row, stats.sy[i] ?? 0]);
+	const cell = (r: number, c: number): number => m[r]?.[c] ?? 0;
+
 	for (let col = 0; col < DIM; col++) {
-		const colOf = (row: number[] | undefined): number => (row === undefined ? 0 : (row[col] ?? 0));
+		// Partial pivoting: bring the largest remaining |entry| of the column
+		// onto the diagonal.
 		let pivot = col;
 		for (let r = col + 1; r < DIM; r++) {
-			if (Math.abs(colOf(m[r])) > Math.abs(colOf(m[pivot]))) pivot = r;
+			if (Math.abs(cell(r, col)) > Math.abs(cell(pivot, col))) pivot = r;
 		}
-		const pivotRow = m[pivot];
-		if (!pivotRow || Math.abs(colOf(pivotRow)) < scale * 1e-10) return undefined;
-		const current = m[col];
-		if (!current) return undefined;
+		if (Math.abs(cell(pivot, col)) < scale * 1e-10) return undefined; // singular
 		if (pivot !== col) {
-			m[pivot] = current;
+			const pivotRow = m[pivot];
+			const diagRow = m[col];
+			if (!pivotRow || !diagRow) return undefined;
+			m[pivot] = diagRow;
 			m[col] = pivotRow;
 		}
+		// Eliminate the column from every other row (Gauss–Jordan).
 		for (let r = 0; r < DIM; r++) {
 			if (r === col) continue;
+			const factor = cell(r, col) / cell(col, col);
+			if (factor === 0) continue;
 			const target = m[r];
 			if (!target) continue;
-			const factor = colOf(target) / colOf(pivotRow);
 			for (let c = col; c <= DIM; c++) {
-				target[c] = (target[c] ?? 0) - factor * (pivotRow[c] ?? 0);
+				target[c] = cell(r, c) - factor * cell(col, c);
 			}
 		}
 	}
-	const a: number[] = [];
+
+	// tokens ≈ Σ a[bucket]·chars; each density must be positive (NaN fails the
+	// check too, as do non-physical negative densities).
+	const ratios = zeroCounts();
 	for (let i = 0; i < DIM; i++) {
-		const diag = m[i]?.[i];
-		if (diag === undefined || Math.abs(diag) < scale * 1e-10) return undefined;
-		const value = (m[i]?.[DIM] ?? 0) / diag;
-		if (!(value > 0)) return undefined; // non-physical density
-		a.push(value);
+		const key = BUCKET_KEYS[i];
+		if (key === undefined) return undefined;
+		const diag = cell(i, i);
+		if (Math.abs(diag) < scale * 1e-10) return undefined;
+		const density = cell(i, DIM) / diag;
+		if (!(density > 0)) return undefined;
+		ratios[key] = 1 / density;
 	}
-	const [cjk, word, digit, punct, space] = a;
-	if (cjk === undefined || word === undefined || digit === undefined || punct === undefined || space === undefined) {
-		return undefined;
-	}
-	return { cjk: 1 / cjk, word: 1 / word, digit: 1 / digit, punct: 1 / punct, space: 1 / space };
+	return ratios;
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -205,13 +213,7 @@ export class CalibrationCache {
 
 	/** Read the cache file. Missing or corrupt data leaves the cache empty. */
 	load(): void {
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(readFileSync(this.file, "utf8"));
-		} catch {
-			return;
-		}
-		const data = parseCalibrationFile(parsed);
+		const data = parseCalibrationFile(readJsonFile(this.file));
 		if (!data) return;
 		for (const [key, stats] of Object.entries(data.models)) {
 			this.models.set(key, stats);
@@ -250,10 +252,7 @@ export class CalibrationCache {
 				version: FILE_VERSION,
 				models: Object.fromEntries(this.models),
 			};
-			mkdirSync(dirname(this.file), { recursive: true });
-			const tempFile = `${this.file}.tmp-${process.pid}`;
-			writeFileSync(tempFile, JSON.stringify(data), "utf8");
-			renameSync(tempFile, this.file);
+			writeFileAtomic(this.file, JSON.stringify(data));
 		} catch {
 			// Cache is disposable; ignore write errors.
 		}

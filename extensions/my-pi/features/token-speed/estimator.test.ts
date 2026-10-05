@@ -6,10 +6,12 @@ import {
 	countTextChars,
 	countTotalChars,
 	DEFAULT_CALIBRATION,
+	estimateInputTokens,
 	estimateTokens,
 	isCjkCodePoint,
 	isZeroCounts,
 	subCounts,
+	zeroCounts,
 } from "./estimator.ts";
 
 describe("isCjkCodePoint", () => {
@@ -134,5 +136,27 @@ describe("estimateTokens", () => {
 
 	it("covers every bucket key exactly", () => {
 		expect(BUCKET_KEYS).toEqual(["cjk", "word", "digit", "punct", "space"]);
+	});
+});
+
+describe("estimateInputTokens", () => {
+	const anchor = { tokens: 1000, chars: { cjk: 0, word: 4000, digit: 0, punct: 0, space: 0 } };
+
+	it("estimates the full payload without an anchor", () => {
+		// "hello world" = 10 word chars + 1 space: 10/4.0 + 1/5.0 = 2.7 → 3.
+		expect(estimateInputTokens(countTextChars("hello world"), undefined)).toBe(3);
+	});
+
+	it("rebases on the authoritative prompt total via the char delta", () => {
+		// Δ = +400 word chars → +100 tokens on top of the anchor's 1000.
+		expect(estimateInputTokens({ cjk: 0, word: 4400, digit: 0, punct: 0, space: 0 }, anchor)).toBe(1100);
+		// A custom calibration applies to the increment.
+		const ratios = { cjk: 1.0, word: 2.0, digit: 2.5, punct: 2.2, space: 5.0 };
+		expect(estimateInputTokens({ cjk: 0, word: 4400, digit: 0, punct: 0, space: 0 }, anchor, ratios)).toBe(1200);
+	});
+
+	it("returns null for payloads with nothing countable", () => {
+		expect(estimateInputTokens(zeroCounts(), anchor)).toBeNull();
+		expect(estimateInputTokens(zeroCounts(), undefined)).toBeNull();
 	});
 });
