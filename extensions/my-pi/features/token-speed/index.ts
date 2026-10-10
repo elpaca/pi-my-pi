@@ -85,16 +85,27 @@ export const tokenSpeedFeature: Feature = {
 			if (message.role !== "assistant") return;
 			status.stopWait();
 			const now = Date.now();
-			const key = calibrationKey(message.provider, message.model);
-			const stats = metrics.onMessageEnd(message.usage, message.provider, message.model, now, cache.get(key));
-			if (!stats) return;
-			trainer.onMessageEnd(key, stats, new Date(now));
+			// A failed request (transport error, timeout, exhausted retries) ends
+			// the message with stopReason "error" and empty usage, and an abort
+			// before the first token leaves nothing measurable. Neither is a
+			// completed message: keep the last completed message's stats and let
+			// the idle display replace the wait/live status instead of leaving
+			// it frozen (pi guarantees message_end fires with stopReason
+			// "error"/"aborted" on every failure path).
+			if (message.stopReason !== "error") {
+				const key = calibrationKey(message.provider, message.model);
+				const stats = metrics.onMessageEnd(message.usage, message.provider, message.model, now, cache.get(key));
+				if (stats) trainer.onMessageEnd(key, stats, new Date(now));
+			}
 			status.renderIdle(ctx);
 		});
 
 		pi.on("agent_end", (_event, ctx) => {
 			lastCtx = ctx;
 			status.stopWait();
+			// Safety net: whatever happened during the run — errors included — the
+			// status line must end up idle, never stuck in a live/wait rendering.
+			status.renderIdle(ctx);
 		});
 
 		pi.on("turn_end", (_event, ctx) => {

@@ -559,4 +559,147 @@ describe("token-speed feature wiring", () => {
 		expect(h.statuses.get("my-pi")).toBeUndefined();
 		expect(h.entries).toHaveLength(0);
 	});
+
+	it("returns to the idle summary when a request fails", () => {
+		const h = registerFeature();
+
+		// A first message completes normally and becomes the idle reference.
+		h.emit("before_provider_request");
+		h.emit("message_start", { message: assistantMessage() });
+		vi.setSystemTime(START + 100);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(40) },
+		});
+		vi.setSystemTime(START + 1200);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
+		});
+		h.emit("message_end", {
+			message: assistantMessage({ usage: { output: 300, reasoning: 100, cacheRead: 1000, cacheWrite: 200 } }),
+		});
+		h.emit("turn_end");
+		expect(h.entries).toHaveLength(1);
+
+		// The next request dies before the first token (connection error /
+		// timeout, retries exhausted): the wait display must not stay frozen.
+		h.emit("before_provider_request", {
+			type: "before_provider_request",
+			payload: { model: "model-x", messages: [{ role: "user", content: "x.".repeat(1900) }] },
+		});
+		vi.advanceTimersByTime(500);
+		expect(h.statuses.get("my-pi")).toBe("I1.4k F0.5s ~182 TPS");
+
+		h.emit("message_start", {
+			message: assistantMessage({ stopReason: "error", errorMessage: "Connection error" }),
+		});
+		h.emit("message_end", {
+			message: assistantMessage({ stopReason: "error", errorMessage: "Connection error" }),
+		});
+		expect(h.statuses.get("my-pi")).toBe("I1.2k F0.1s T100 O200 182TPS");
+
+		// The wait ticker is gone and the idle summary survives.
+		vi.advanceTimersByTime(500);
+		expect(h.statuses.get("my-pi")).toBe("I1.2k F0.1s T100 O200 182TPS");
+
+		// The failed turn persists nothing new.
+		h.emit("turn_end");
+		expect(h.entries).toHaveLength(1);
+	});
+
+	it("clears the status when the very first request fails", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request");
+		vi.advanceTimersByTime(300);
+		expect(h.statuses.get("my-pi")).toBe("F0.3s");
+
+		h.emit("message_start", { message: assistantMessage({ stopReason: "error" }) });
+		h.emit("message_end", {
+			message: assistantMessage({ stopReason: "error", errorMessage: "Request timed out" }),
+		});
+		// Nothing measurable has ever happened: no stale live display remains.
+		expect(h.statuses.get("my-pi")).toBeUndefined();
+		vi.advanceTimersByTime(500);
+		expect(h.statuses.get("my-pi")).toBeUndefined();
+	});
+
+	it("keeps the last completed message when a streaming message errors mid-way", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request");
+		h.emit("message_start", { message: assistantMessage() });
+		vi.setSystemTime(START + 100);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(40) },
+		});
+		vi.setSystemTime(START + 1200);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
+		});
+		h.emit("message_end", {
+			message: assistantMessage({ usage: { output: 300, reasoning: 100, cacheRead: 1000, cacheWrite: 200 } }),
+		});
+		h.emit("turn_end");
+		expect(h.entries).toHaveLength(1);
+
+		// Second request streams a little and then dies: the partial data is
+		// not a completed message, so the idle summary and the persisted
+		// stats stay with the first one.
+		h.emit("before_provider_request");
+		h.emit("message_start", { message: assistantMessage() });
+		vi.setSystemTime(START + 1300);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
+		});
+		// First delta of the new message: counters are live, the rate is still
+		// inside its minimum window and the payloadless request shows no input.
+		expect(h.statuses.get("my-pi")).toBe("F0.1s O95");
+		h.emit("message_end", {
+			message: assistantMessage({ stopReason: "error", errorMessage: "Connection error" }),
+		});
+		expect(h.statuses.get("my-pi")).toBe("I1.2k F0.1s T100 O200 182TPS");
+		h.emit("turn_end");
+		expect(h.entries).toHaveLength(1);
+	});
+
+	it("restores the idle summary when the user aborts before the first token", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request");
+		h.emit("message_start", { message: assistantMessage() });
+		vi.setSystemTime(START + 100);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(40) },
+		});
+		vi.setSystemTime(START + 1200);
+		h.emit("message_update", {
+			message: assistantMessage(),
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(380) },
+		});
+		h.emit("message_end", {
+			message: assistantMessage({ usage: { output: 300, reasoning: 100, cacheRead: 1000, cacheWrite: 200 } }),
+		});
+
+		h.emit("before_provider_request");
+		vi.advanceTimersByTime(300);
+		expect(h.statuses.get("my-pi")).toBe("F0.3s ~182 TPS");
+		h.emit("message_start", { message: assistantMessage({ stopReason: "aborted" }) });
+		h.emit("message_end", { message: assistantMessage({ stopReason: "aborted" }) });
+		expect(h.statuses.get("my-pi")).toBe("I1.2k F0.1s T100 O200 182TPS");
+	});
+
+	it("resets the status to idle on agent_end even without a message_end", () => {
+		const h = registerFeature();
+		h.emit("before_provider_request");
+		vi.advanceTimersByTime(200);
+		expect(h.statuses.get("my-pi")).toBe("F0.2s");
+
+		h.emit("agent_end");
+		expect(h.statuses.get("my-pi")).toBeUndefined();
+		vi.advanceTimersByTime(500);
+		expect(h.statuses.get("my-pi")).toBeUndefined();
+	});
 });
